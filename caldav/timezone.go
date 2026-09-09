@@ -103,10 +103,19 @@ func rawProp(name, value string) *ical.Prop {
 	return prop
 }
 
+// formatUTCOffset writes an RFC 5545 UTC-offset value. Seconds are emitted
+// only when the offset actually has them, as several pre-1972 zones do:
+// Africa/Monrovia ran at -00:44:30, and truncating that to -00:44 moves every
+// reading before its 1972 changeover by half a minute.
 func formatUTCOffset(seconds int) string {
 	sign := "+"
 	if seconds < 0 {
 		sign, seconds = "-", -seconds
 	}
+
+	if remainder := seconds % 60; remainder != 0 {
+		return fmt.Sprintf("%s%02d%02d%02d", sign, seconds/3600, (seconds%3600)/60, remainder)
+	}
+
 	return fmt.Sprintf("%s%02d%02d", sign, seconds/3600, (seconds%3600)/60)
 }
