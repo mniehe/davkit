@@ -2,6 +2,7 @@ package caldav
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,13 @@ import (
 )
 
 const localDateTimeLayout = "20060102T150405"
+
+// An RFC 5545 DATE-TIME carries a four-digit year, so these are the years a
+// value can be written back out in.
+const (
+	minCalendarYear = 1
+	maxCalendarYear = 9999
+)
 
 // dateTimeProps are the properties whose value is a DATE-TIME the engine reads
 // as an instant. A floating one of these is resolved against a fallback zone;
@@ -236,7 +244,7 @@ func parseObservance(sub *ical.Component) (observance, error) {
 	// RecurrenceSet folds RRULE, RDATE and DTSTART into one iterator, reading
 	// the onsets as the wall clocks they are written in. A sub-component with no
 	// RRULE returns nil, leaving the single DTSTART plus any RDATEs.
-	onsets := splitDateLists(sub)
+	onsets := shiftUntilToOnsetFrame(splitDateLists(sub), from)
 	set, err := onsets.RecurrenceSet(time.UTC)
 	if err != nil {
 		return observance{}, fmt.Errorf("%s has an invalid recurrence: %w", sub.Name, err)
@@ -258,6 +266,75 @@ func parseObservance(sub *ical.Component) (observance, error) {
 		obs.rdates = append(obs.rdates, t)
 	}
 	return obs, nil
+}
+
+// shiftUntilToOnsetFrame moves a UTC UNTIL into the frame its own onsets are
+// written in.
+//
+// An observance's onsets are wall clocks in the offset being left, but §3.6.5
+// requires UNTIL to name the last of them as a UTC instant. The recurrence
+// engine compares the two in a single frame, so a bound left as written sits
+// offsetFrom away from the onset it is meant to include: east of Greenwich it
+// lands before that onset and drops it, taking the whole era's final year with
+// it, while west of Greenwich it lands after and happens to be harmless. Every
+// conforming producer emits this shape, so the correction belongs here rather
+// than in whatever wrote the calendar.
+func shiftUntilToOnsetFrame(comp *ical.Component, offsetFrom time.Duration) *ical.Component {
+	rule := comp.Props.Get(ical.PropRecurrenceRule)
+	if rule == nil {
+		return comp
+	}
+
+	parts := strings.Split(rule.Value, ";")
+	changed := false
+	for i, part := range parts {
+		value, ok := strings.CutPrefix(part, "UNTIL=")
+		if !ok {
+			continue
+		}
+
+		instant, err := time.ParseInLocation(localDateTimeLayout, strings.TrimSuffix(value, "Z"), time.UTC)
+		if err != nil {
+			continue
+		}
+
+		// Take whichever of the two readings is later. For a conforming UTC
+		// bound east of Greenwich that is the shifted one, which is the whole
+		// point. West of Greenwich the bound as written already sits at or
+		// after the onset it names, so shifting would only risk moving it
+		// backwards off that onset. The same choice repairs a producer that
+		// wrote the onset's local clock with a stray Z, which the shift alone
+		// would have made worse. Onsets are a year apart, so the later reading
+		// can never reach the following one.
+		bound := instant
+		if shifted := instant.Add(offsetFrom); shifted.After(bound) {
+			bound = shifted
+		}
+
+		// The conventional "forever" bound is 99991231T235959Z, and nudging
+		// that forward yields a five-digit year no recurrence parser accepts,
+		// turning a calendar that read perfectly well into one that cannot be
+		// read at all.
+		if bound.Year() > maxCalendarYear || bound.Year() < minCalendarYear {
+			continue
+		}
+
+		// Written in the frame the onsets use, which is what the recurrence
+		// engine compares it against.
+		parts[i] = "UNTIL=" + bound.Format(localDateTimeLayout)
+		changed = true
+	}
+	if !changed {
+		return comp
+	}
+
+	shifted := *comp
+	shifted.Props = maps.Clone(comp.Props)
+	rewritten := *rule
+	rewritten.Value = strings.Join(parts, ";")
+	shifted.Props[ical.PropRecurrenceRule] = []ical.Prop{rewritten}
+
+	return &shifted
 }
 
 // utcOffset reads an RFC 5545 UTC-offset property (±HHMM or ±HHMMSS).
