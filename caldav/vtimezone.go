@@ -3,6 +3,7 @@ package caldav
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -444,13 +445,14 @@ func (r *tzResolver) transitionsThrough(limitYear int) ([]transition, error) {
 			})
 		}
 	}
-	// Insertion by ascending UTC instant; the lists per observance are already
-	// ascending, so a simple stable sort is enough and the counts are small.
-	for i := 1; i < len(trans); i++ {
-		for j := i; j > 0 && trans[j].utc.Before(trans[j-1].utc); j-- {
-			trans[j], trans[j-1] = trans[j-1], trans[j]
-		}
-	}
+	// Ascending by UTC instant. Each observance's own list is ascending but the
+	// lists are unordered relative to each other, so an insertion pass here is
+	// quadratic on a definition whose later observances start earlier — which
+	// a hostile calendar can arrange in a few hundred bytes.
+	slices.SortStableFunc(trans, func(a, b transition) int {
+		return a.utc.Compare(b.utc)
+	})
+
 	return trans, nil
 }
 
