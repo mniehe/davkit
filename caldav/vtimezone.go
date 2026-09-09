@@ -188,6 +188,10 @@ func localInstantToUTC(value string, r *tzResolver) (utc string, converted bool,
 type tzResolver struct {
 	id          string
 	observances []observance
+	// priorOffset is what the zone was on before any observance began: the
+	// offset the earliest one moves away from. A reading older than every
+	// onset resolves to this.
+	priorOffset time.Duration
 }
 
 // observance is one STANDARD or DAYLIGHT sub-component: the offset it moves
@@ -223,6 +227,15 @@ func newTZResolver(vtz *ical.Component) (*tzResolver, error) {
 	if len(r.observances) == 0 {
 		return nil, fmt.Errorf("caldav: VTIMEZONE %q has no STANDARD or DAYLIGHT sub-component", id)
 	}
+
+	earliest := &r.observances[0]
+	for i := range r.observances {
+		if r.observances[i].dtstart.Before(earliest.dtstart) {
+			earliest = &r.observances[i]
+		}
+	}
+	r.priorOffset = earliest.offsetFrom
+
 	return r, nil
 }
 
@@ -393,8 +406,11 @@ func (r *tzResolver) offsetAt(wall time.Time) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
+	// No onset at or before this reading means the zone had not started
+	// changing yet, which is an answer rather than a failure: every rule in
+	// the definition begins later than the moment being asked about.
 	if len(trans) == 0 {
-		return 0, fmt.Errorf("caldav: VTIMEZONE %q yielded no onsets", r.id)
+		return r.priorOffset, nil
 	}
 
 	for i := len(trans) - 1; i >= 0; i-- {
@@ -403,8 +419,11 @@ func (r *tzResolver) offsetAt(wall time.Time) (time.Duration, error) {
 		}
 	}
 	// Before the first onset the zone is in the earliest observance's prior
-	// offset.
-	return trans[0].offsetFrom, nil
+	// offset. That has to come from the definition as a whole, not from the
+	// transitions materialised for this reading: a reading older than every
+	// rule leaves only the observances that carry no rule, so reading it off
+	// those would answer with whichever of them happened to be listed.
+	return r.priorOffset, nil
 }
 
 // transitionsThrough materialises every onset up to and including limitYear,
