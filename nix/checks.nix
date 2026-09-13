@@ -8,7 +8,7 @@
 
   # Shared by every check that compiles the module. The hash covers go.sum's
   # closure, so it changes when a dependency does.
-  vendorHash = "sha256-yIusSeCj0WIzVUADKUyvpvk202JcRp4ZWfTYe/VS/5Q=";
+  vendorHash = "sha256-s+e6mHjSfV92wH6toCpXV9Cf7SLjKuhxoq5GyT0UFuU=";
 in {
   # The Go suite, including conformance/litmus_test.go. litmus is a
   # nativeBuildInput rather than a Go dependency: the test skips without it, so
