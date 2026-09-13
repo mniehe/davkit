@@ -28,6 +28,9 @@ var vcardVersions = map[string]bool{"3.0": true, "4.0": true}
 // with the FN both versions require and the UID this server keys items by,
 // and supported-address-data for a version the server never advertised.
 func parseCardBody(body []byte) (contentID string, err error) {
+	if shapeErr := CheckShape(body); shapeErr != nil {
+		return "", internal.NewPreconditionError(http.StatusForbidden, validAddressDataName)
+	}
 	// The decoder is lenient: it skips bytes before BEGIN:VCARD and after
 	// END:VCARD. Stored bytes are served verbatim, so the envelope has to be
 	// checked here or a stricter reader than go-vcard gets handed junk.
@@ -156,6 +159,10 @@ func (a *adapter) Put(w http.ResponseWriter, r *http.Request) error {
 		var quota *QuotaExceededError
 		if errors.As(err, &quota) {
 			return internal.HTTPErrorf(http.StatusInsufficientStorage, "carddav: quota exceeded")
+		}
+		var invalid *InvalidContentError
+		if errors.As(err, &invalid) {
+			return internal.NewPreconditionError(http.StatusForbidden, validAddressDataName)
 		}
 		// The address book was fetched above, so a missing parent is a race with
 		// a concurrent deletion — RFC 4918 §9.7.1 answers 409, not 404.

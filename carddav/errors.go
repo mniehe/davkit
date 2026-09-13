@@ -27,6 +27,17 @@ func (e *DuplicateContentIDError) Error() string {
 	return fmt.Sprintf("carddav: content ID already used by %q", e.Existing)
 }
 
+// InvalidContentError reports content that does not parse.
+type InvalidContentError struct {
+	Err error
+}
+
+func (e *InvalidContentError) Error() string {
+	return fmt.Sprintf("carddav: invalid content: %v", e.Err)
+}
+
+func (e *InvalidContentError) Unwrap() error { return e.Err }
+
 // QuotaExceededError reports a write that would take the address book over a limit
 // the backend enforces.
 type QuotaExceededError struct {
