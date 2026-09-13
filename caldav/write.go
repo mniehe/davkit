@@ -38,6 +38,10 @@ var kindByComponent = map[string]ItemKind{
 // scheduling METHOD, mixed component kinds, or components that do not agree on
 // one UID.
 func parseItemBody(body []byte) (parsedItem, error) {
+	if err := CheckShape(body); err != nil {
+		return parsedItem{}, internal.NewPreconditionError(http.StatusForbidden, validCalendarDataName)
+	}
+
 	dec := ical.NewDecoder(bytes.NewReader(body))
 	cal, err := dec.Decode()
 	if err != nil {
@@ -172,6 +176,10 @@ func (a *adapter) Put(w http.ResponseWriter, r *http.Request) error {
 		var quota *QuotaExceededError
 		if errors.As(err, &quota) {
 			return internal.HTTPErrorf(http.StatusInsufficientStorage, "caldav: quota exceeded")
+		}
+		var invalid *InvalidContentError
+		if errors.As(err, &invalid) {
+			return internal.NewPreconditionError(http.StatusForbidden, validCalendarDataName)
 		}
 		// The calendar was fetched above, so a missing parent is a race with a
 		// concurrent deletion — RFC 4918 §9.7.1 answers 409, not 404.
