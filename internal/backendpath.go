@@ -32,15 +32,16 @@ func ValidateMemberPath(collectionPath, memberPath string) error {
 }
 
 // ValidateSyncRequest checks the sync-collection REPORT grammar of RFC 6578
-// §3.2: Depth is absent or 0, and exactly one DAV:sync-level names a scope.
+// §3.2, except that Depth: 1 is accepted for client compatibility. The
+// DAV:sync-level alone determines the scope, never the Depth header.
 //
 // Only level 1 is implemented. An infinite request is refused rather than
 // answered from a flat result, because returning a sync token alongside a
 // narrower set than was asked for tells the client it holds state it was never
 // sent, and it has no way to discover the omission later.
 func ValidateSyncRequest(r *http.Request, query *SyncCollectionQuery) error {
-	if depth := r.Header.Get("Depth"); depth != "" && depth != "0" {
-		return HTTPErrorf(http.StatusBadRequest, "webdav: sync-collection requires Depth 0 or no Depth header")
+	if depth := r.Header.Get("Depth"); depth != "" && depth != "0" && depth != "1" {
+		return HTTPErrorf(http.StatusBadRequest, "webdav: sync-collection requires Depth 0, 1 or no Depth header")
 	}
 	switch query.SyncLevel {
 	case "1":
