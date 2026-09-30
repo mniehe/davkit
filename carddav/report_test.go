@@ -540,11 +540,13 @@ func TestMultigetConfinesHrefsToTheCollection(t *testing.T) {
 	}
 }
 
+const syncLevelOne = `<D:sync-level>1</D:sync-level>`
+
 func syncBody(token string) string {
 	return `<?xml version="1.0"?>
 <D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
   <D:sync-token>` + token + `</D:sync-token>
-  <D:sync-level>1</D:sync-level>
+  ` + syncLevelOne + `
   <D:prop><D:getetag/></D:prop>
 </D:sync-collection>`
 }
@@ -564,112 +566,97 @@ func TestSyncCollectionInitialSync(t *testing.T) {
 	}
 }
 
+// syncAt sends a sync-collection REPORT with the given Depth header, omitting
+// the header when depth is empty. Rows come back sorted by href, because
+// carddavmem iterates a map and so orders them differently on every request.
+func syncAt(t *testing.T, h *carddav.Handler, depth, token string) multistatus {
+	t.Helper()
+
+	r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(syncBody(token)))
+	r.Header.Set("Content-Type", "application/xml")
+	if depth != "" {
+		r.Header.Set("Depth", depth)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("Depth %q: status = %d, want %d\n%s", depth, w.Code, http.StatusMultiStatus, w.Body.String())
+	}
+	var ms multistatus
+	if err := xml.Unmarshal(w.Body.Bytes(), &ms); err != nil {
+		t.Fatalf("Depth %q: decoding multistatus: %v\n%s", depth, err, w.Body.String())
+	}
+	slices.SortFunc(ms.Responses, func(a, b davResponse) int { return strings.Compare(a.Href, b.Href) })
+	return ms
+}
+
 func TestSyncCollectionDepthOneMatchesDepthZero(t *testing.T) {
 	store := abStore(t)
 	h := handlerFor(t, store, carddav.Config{})
 
-	syncAtDepth := func(depth, token string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(syncBody(token)))
-		r.Header.Set("Content-Type", "application/xml")
-		r.Header.Set("Depth", depth)
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
-	}
+	zero := syncAt(t, h, "0", "")
+	one := syncAt(t, h, "1", "")
 
-	zero := syncAtDepth("0", "")
-	one := syncAtDepth("1", "") // Compatibility with clients sending a draft-era Depth: 1.
-	if one.Code != http.StatusMultiStatus || zero.Code != one.Code {
-		t.Fatalf("Depth 0 status = %d, Depth 1 status = %d, want 207: %s", zero.Code, one.Code, one.Body.String())
+	if !reflect.DeepEqual(zero, one) {
+		t.Fatalf("initial sync differs by Depth:\n 0 = %+v\n 1 = %+v", zero, one)
 	}
-	// carddavmem iterates a map, so row order is not stable across requests.
-	var ms multistatus
-	if err := xml.Unmarshal(one.Body.Bytes(), &ms); err != nil {
-		t.Fatalf("decoding Depth 1 response: %v", err)
-	}
-	var zeroMS multistatus
-	if err := xml.Unmarshal(zero.Body.Bytes(), &zeroMS); err != nil {
-		t.Fatalf("decoding Depth 0 response: %v", err)
-	}
-	if got := ms.hrefs(); len(got) != 2 || !slices.Contains(got, "/alice/work/ada.vcf") || !slices.Contains(got, "/alice/work/bob.vcf") {
+	if got := one.hrefs(); len(got) != 2 || got[0] != "/alice/work/ada.vcf" || got[1] != "/alice/work/bob.vcf" {
 		t.Errorf("initial hrefs = %v, want both objects", got)
 	}
-	token := ms.SyncToken
-	if token == "" {
+	if one.SyncToken == "" {
 		t.Fatal("initial sync returned no token")
-	}
-	if zeroMS.SyncToken != token || len(zeroMS.Responses) != len(ms.Responses) {
-		t.Fatalf("initial responses differ by Depth: 0 = %s; 1 = %s", zero.Body.String(), one.Body.String())
-	}
-	for _, row := range ms.Responses {
-		if !reflect.DeepEqual(row, zeroMS.at(t, row.Href)) {
-			t.Errorf("initial row %s differs by Depth", row.Href)
-		}
 	}
 
 	seedRaw(t, store, "alice", "nova.vcf", novaV3VCF, "nova")
-	zero = syncAtDepth("0", token)
-	one = syncAtDepth("1", token)
-	if one.Code != http.StatusMultiStatus || zero.Code != one.Code {
-		t.Fatalf("delta differs by Depth: 0 = %d %s; 1 = %d %s", zero.Code, zero.Body.String(), one.Code, one.Body.String())
+	zeroDelta := syncAt(t, h, "0", one.SyncToken)
+	oneDelta := syncAt(t, h, "1", one.SyncToken)
+
+	if !reflect.DeepEqual(zeroDelta, oneDelta) {
+		t.Fatalf("delta differs by Depth:\n 0 = %+v\n 1 = %+v", zeroDelta, oneDelta)
 	}
-	ms = multistatus{}
-	if err := xml.Unmarshal(one.Body.Bytes(), &ms); err != nil {
-		t.Fatalf("decoding Depth 1 delta: %v", err)
-	}
-	zeroMS = multistatus{}
-	if err := xml.Unmarshal(zero.Body.Bytes(), &zeroMS); err != nil {
-		t.Fatalf("decoding Depth 0 delta: %v", err)
-	}
-	if zeroMS.SyncToken != ms.SyncToken || len(zeroMS.Responses) != len(ms.Responses) || !reflect.DeepEqual(zeroMS.at(t, "/alice/work/nova.vcf"), ms.at(t, "/alice/work/nova.vcf")) {
-		t.Errorf("delta response differs by Depth: 0 = %s; 1 = %s", zero.Body.String(), one.Body.String())
-	}
-	if got := ms.hrefs(); len(got) != 1 || got[0] != "/alice/work/nova.vcf" {
+	if got := oneDelta.hrefs(); len(got) != 1 || got[0] != "/alice/work/nova.vcf" {
 		t.Errorf("delta hrefs = %v, want only the changed object", got)
 	}
-	if ms.SyncToken == "" || ms.SyncToken == token {
-		t.Errorf("token did not advance: %q", ms.SyncToken)
+	if oneDelta.SyncToken == "" || oneDelta.SyncToken == one.SyncToken {
+		t.Errorf("token did not advance: %q", oneDelta.SyncToken)
 	}
 }
 
 func TestSyncCollectionDepthOneStillRefusesInvalidDepthAndSyncLevel(t *testing.T) {
 	h := handlerFor(t, newStore(t), carddav.Config{})
-	for _, depth := range []string{"infinity", "2", "banana"} {
-		t.Run(depth, func(t *testing.T) {
-			r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(syncBody("")))
+
+	for _, tc := range []struct {
+		name  string
+		depth string
+		level string
+		want  int
+	}{
+		{"Depth infinity", "infinity", syncLevelOne, http.StatusBadRequest},
+		{"Depth 2", "2", syncLevelOne, http.StatusBadRequest},
+		{"Depth banana", "banana", syncLevelOne, http.StatusBadRequest},
+
+		{"an empty sync-level", "1", "<D:sync-level></D:sync-level>", http.StatusBadRequest},
+		{"sync-level infinite", "1", "<D:sync-level>infinite</D:sync-level>", http.StatusBadRequest},
+		{"sync-level banana", "1", "<D:sync-level>banana</D:sync-level>", http.StatusBadRequest},
+		{"no sync-level at all", "1", "", http.StatusBadRequest},
+
+		{"an absent Depth", "", syncLevelOne, http.StatusMultiStatus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Replace(syncBody(""), syncLevelOne, tc.level, 1)
+			r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(body))
 			r.Header.Set("Content-Type", "application/xml")
-			r.Header.Set("Depth", depth)
+			if tc.depth != "" {
+				r.Header.Set("Depth", tc.depth)
+			}
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, r)
-			if w.Code != http.StatusBadRequest {
-				t.Errorf("Depth %q: status = %d, want 400", depth, w.Code)
+
+			if w.Code != tc.want {
+				t.Errorf("status = %d, want %d: %s", w.Code, tc.want, w.Body.String())
 			}
 		})
-	}
-	for _, level := range []string{"", "infinite", "banana"} {
-		t.Run("level "+level, func(t *testing.T) {
-			r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(strings.Replace(syncBody(""), "<D:sync-level>1</D:sync-level>", "<D:sync-level>"+level+"</D:sync-level>", 1)))
-			r.Header.Set("Content-Type", "application/xml")
-			r.Header.Set("Depth", "1")
-			w := httptest.NewRecorder()
-			h.ServeHTTP(w, r)
-			if w.Code != http.StatusBadRequest {
-				t.Errorf("sync-level %q: status = %d, want 400", level, w.Code)
-			}
-		})
-	}
-	t.Run("missing sync-level", func(t *testing.T) {
-		r := httptest.NewRequest("REPORT", "/alice/work/", strings.NewReader(strings.Replace(syncBody(""), "<D:sync-level>1</D:sync-level>", "", 1)))
-		r.Header.Set("Content-Type", "application/xml")
-		r.Header.Set("Depth", "1")
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("missing sync-level: status = %d, want 400", w.Code)
-		}
-	})
-	if w := report(t, h, "/alice/work/", syncBody("")); w.Code != http.StatusMultiStatus {
-		t.Errorf("absent Depth: status = %d, want 207", w.Code)
 	}
 }
 
