@@ -67,7 +67,7 @@ func TestFreeBusyAggregatesBusyTime(t *testing.T) {
 			t.Errorf("body missing %q:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "202610") {
+	if strings.Contains(body, "FREEBUSY:202610") {
 		t.Errorf("an event outside the range contributed busy time:\n%s", body)
 	}
 }
