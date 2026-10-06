@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/emersion/go-ical"
 	"github.com/mniehe/davkit/internal"
@@ -94,7 +95,30 @@ func parseItemBody(body []byte) (parsedItem, error) {
 	if item.kind == 0 {
 		return parsedItem{}, internal.NewPreconditionError(http.StatusForbidden, validCalendarObjectName)
 	}
+	if !recurrenceReadable(cal) {
+		return parsedItem{}, internal.NewPreconditionError(http.StatusForbidden, validCalendarDataName)
+	}
 	return item, nil
+}
+
+// recurrenceReadable reports whether every component's RRULE, RDATE and
+// EXDATE read the way the matcher and the expander will read them, so that
+// storing the object cannot fail every later time-range query on its calendar.
+// A set too large for those walks to finish is refused for the same reason.
+func recurrenceReadable(cal *ical.Calendar) bool {
+	resolved, err := resolveObjectTimes(cal, nil)
+	if err != nil {
+		return false
+	}
+	for _, comp := range resolved.Children {
+		if comp.Name == ical.CompTimezone {
+			continue
+		}
+		if _, err := recurrenceOf(comp, time.UTC); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func checkItemContentType(header string) error {
