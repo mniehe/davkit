@@ -268,65 +268,78 @@ func optDateTime(comp *ical.Component, name string, loc *time.Location) (value t
 	return value, err == nil, err
 }
 
+// todoTimes are the VTODO properties the RFC 4791 §9.9 table reads. duration
+// is only read where a row uses it, so an unreadable one elsewhere is ignored
+// as before.
+type todoTimes struct {
+	start, due, completed, created             time.Time
+	hasStart, hasDue, hasCompleted, hasCreated bool
+	duration                                   time.Duration
+	hasDuration                                bool
+}
+
+func todoTimesOf(comp *ical.Component, loc *time.Location) (todoTimes, error) {
+	var t todoTimes
+	var err error
+	if t.start, t.hasStart, err = optDateTime(comp, ical.PropDateTimeStart, loc); err != nil {
+		return todoTimes{}, err
+	}
+	if t.due, t.hasDue, err = optDateTime(comp, ical.PropDue, loc); err != nil {
+		return todoTimes{}, err
+	}
+	if t.completed, t.hasCompleted, err = optDateTime(comp, ical.PropCompleted, loc); err != nil {
+		return todoTimes{}, err
+	}
+	if t.created, t.hasCreated, err = optDateTime(comp, ical.PropCreated, loc); err != nil {
+		return todoTimes{}, err
+	}
+	durProp := comp.Props.Get(ical.PropDuration)
+	t.hasDuration = durProp != nil
+	if t.hasStart && t.hasDuration && !t.hasDue {
+		if t.duration, err = durProp.Duration(); err != nil {
+			return todoTimes{}, err
+		}
+	}
+	return t, nil
+}
+
 // todoOverlaps applies the RFC 4791 §9.9 VTODO table. Which row applies depends
 // on which of DTSTART, DURATION, DUE, COMPLETED and CREATED the component
 // carries, and the rows mix inclusive and exclusive bounds, so each is written
 // out rather than folded into a shared interval test. A zero filter bound is
 // unbounded and satisfies its side of every comparison.
-func todoOverlaps(start, end time.Time, comp *ical.Component, loc *time.Location) (bool, error) {
-	startAtOrBefore := func(t time.Time) bool { return start.IsZero() || !start.After(t) }
-	startBefore := func(t time.Time) bool { return start.IsZero() || start.Before(t) }
-	endAfter := func(t time.Time) bool { return end.IsZero() || end.After(t) }
-	endAtOrAfter := func(t time.Time) bool { return end.IsZero() || !end.Before(t) }
-
-	dtStart, hasStart, err := optDateTime(comp, ical.PropDateTimeStart, loc)
-	if err != nil {
-		return false, err
-	}
-	due, hasDue, err := optDateTime(comp, ical.PropDue, loc)
-	if err != nil {
-		return false, err
-	}
-	completed, hasCompleted, err := optDateTime(comp, ical.PropCompleted, loc)
-	if err != nil {
-		return false, err
-	}
-	created, hasCreated, err := optDateTime(comp, ical.PropCreated, loc)
-	if err != nil {
-		return false, err
-	}
-	durProp := comp.Props.Get(ical.PropDuration)
+func todoOverlaps(start, end time.Time, t *todoTimes) bool {
+	startAtOrBefore := func(x time.Time) bool { return start.IsZero() || !start.After(x) }
+	startBefore := func(x time.Time) bool { return start.IsZero() || start.Before(x) }
+	endAfter := func(x time.Time) bool { return end.IsZero() || end.After(x) }
+	endAtOrAfter := func(x time.Time) bool { return end.IsZero() || !end.Before(x) }
 
 	switch {
-	case hasStart && durProp != nil && !hasDue:
-		dur, derr := durProp.Duration()
-		if derr != nil {
-			return false, derr
-		}
-		deadline := dtStart.Add(dur)
-		return startAtOrBefore(deadline) && (endAfter(dtStart) || endAtOrAfter(deadline)), nil
+	case t.hasStart && t.hasDuration && !t.hasDue:
+		deadline := t.start.Add(t.duration)
+		return startAtOrBefore(deadline) && (endAfter(t.start) || endAtOrAfter(deadline))
 
-	case hasStart && durProp == nil && hasDue:
-		return (startBefore(due) || startAtOrBefore(dtStart)) && (endAfter(dtStart) || endAtOrAfter(due)), nil
+	case t.hasStart && !t.hasDuration && t.hasDue:
+		return (startBefore(t.due) || startAtOrBefore(t.start)) && (endAfter(t.start) || endAtOrAfter(t.due))
 
-	case hasStart && durProp == nil && !hasDue:
-		return startAtOrBefore(dtStart) && endAfter(dtStart), nil
+	case t.hasStart && !t.hasDuration && !t.hasDue:
+		return startAtOrBefore(t.start) && endAfter(t.start)
 
-	case !hasStart && durProp == nil && hasDue:
-		return startBefore(due) && endAtOrAfter(due), nil
+	case !t.hasStart && !t.hasDuration && t.hasDue:
+		return startBefore(t.due) && endAtOrAfter(t.due)
 
-	case !hasStart && durProp == nil && !hasDue && hasCompleted && hasCreated:
-		return (startAtOrBefore(created) || startAtOrBefore(completed)) &&
-			(endAtOrAfter(created) || endAtOrAfter(completed)), nil
+	case !t.hasStart && !t.hasDuration && !t.hasDue && t.hasCompleted && t.hasCreated:
+		return (startAtOrBefore(t.created) || startAtOrBefore(t.completed)) &&
+			(endAtOrAfter(t.created) || endAtOrAfter(t.completed))
 
-	case !hasStart && durProp == nil && !hasDue && hasCompleted && !hasCreated:
-		return startAtOrBefore(completed) && endAtOrAfter(completed), nil
+	case !t.hasStart && !t.hasDuration && !t.hasDue && t.hasCompleted && !t.hasCreated:
+		return startAtOrBefore(t.completed) && endAtOrAfter(t.completed)
 
-	case !hasStart && durProp == nil && !hasDue && !hasCompleted && hasCreated:
-		return endAfter(created), nil
+	case !t.hasStart && !t.hasDuration && !t.hasDue && !t.hasCompleted && t.hasCreated:
+		return endAfter(t.created)
 	}
 	// The table's last row: a VTODO carrying none of these overlaps everything.
-	return true, nil
+	return true
 }
 
 // compOverlaps applies the RFC 4791 §9.9 table for the component's own type. A
@@ -360,7 +373,11 @@ func compOverlaps(start, end time.Time, comp *ical.Component) (bool, error) {
 		return intervalOverlaps(start, end, from, to), nil
 
 	case ical.CompToDo:
-		return todoOverlaps(start, end, comp, loc)
+		times, err := todoTimesOf(comp, loc)
+		if err != nil {
+			return false, err
+		}
+		return todoOverlaps(start, end, &times), nil
 
 	case ical.CompFreeBusy:
 		return freeBusyOverlaps(start, end, comp, loc)
@@ -371,42 +388,48 @@ func compOverlaps(start, end time.Time, comp *ical.Component) (bool, error) {
 func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error) {
 	// See https://datatracker.ietf.org/doc/html/rfc4791#section-9.9
 
-	rset, err := splitDateLists(comp).RecurrenceSet(start.Location())
+	rec, err := recurrenceOf(comp, start.Location())
+	if errors.Is(err, errTooManyRecurrenceDates) {
+		return false, timeRangeOverflow()
+	}
 	if err != nil {
 		return false, err
 	}
-	if rset == nil {
+	if rec == nil {
 		return compOverlaps(start, end, comp)
 	}
 
-	// A recurring component is measured by its own span, then that span is
-	// carried to each occurrence. Reading it here rather than above keeps a
+	// Each occurrence is measured by the rules for the component's kind, read
+	// once from the master. Reading them here rather than above keeps a
 	// component with no DTSTART out of compInterval, which cannot describe one.
-	compStart, compEnd, err := compInterval(comp, start.Location())
+	extent, err := extentOf(comp, start.Location())
 	if err != nil {
 		return false, err
 	}
-	duration := compEnd.Sub(compStart)
 
-	// Each occurrence carries the master's duration, so one beginning before the
-	// window can still reach into it.
-	iter := rset.Iterator()
+	// An occurrence beginning before the window can still reach into it, and a
+	// VTODO's inclusive rows can reach one starting exactly at its end.
+	next := rec.iterator()
 	for n := 0; n < maxRecurrenceIterations; n++ {
-		occ, ok := iter()
+		occ, ok := next()
 		if !ok {
 			return false, nil
 		}
-		if !end.IsZero() && !occ.Before(end) {
+		if !end.IsZero() && occ.start.After(end) {
 			// Occurrences only increase, so none remain in range.
 			return false, nil
 		}
-		if intervalOverlaps(start, end, occ, occ.Add(duration)) {
+		if extent.overlaps(start, end, occ) {
 			return true, nil
 		}
 	}
 	// Answering true here would return data the filter excluded: nothing has been
 	// established, only that the budget ran out.
-	return false, internal.HTTPErrorf(http.StatusInsufficientStorage, "caldav: time-range filter exceeded %d recurrence iterations", maxRecurrenceIterations)
+	return false, timeRangeOverflow()
+}
+
+func timeRangeOverflow() error {
+	return internal.HTTPErrorf(http.StatusInsufficientStorage, "caldav: time-range filter exceeded %d recurrence iterations", maxRecurrenceIterations)
 }
 
 func matchPropTimeRange(start, end time.Time, field *ical.Prop) (bool, error) {

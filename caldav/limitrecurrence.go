@@ -1,6 +1,7 @@
 package caldav
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ func limitRecurrenceCalendar(cal *ical.Calendar, window *calendarTimeWindow) (*i
 		}
 		masters[propValue(child, ical.PropUID)] = child
 	}
+	periods := newPeriodIndex()
 
 	root := cloneComponent(cal.Component)
 	root.Children = nil
@@ -39,7 +41,7 @@ func limitRecurrenceCalendar(cal *ical.Calendar, window *calendarTimeWindow) (*i
 			out.Children = append(out.Children, child)
 			continue
 		}
-		impacts, err := overrideImpacts(resolved.Children[i], masters, window)
+		impacts, err := overrideImpacts(resolved.Children[i], masters, periods, window)
 		if err != nil {
 			return nil, err
 		}
@@ -55,7 +57,7 @@ func limitRecurrenceCalendar(cal *ical.Calendar, window *calendarTimeWindow) (*i
 // to use the logic CALDAV:time-range is defined with, which §9.9 makes
 // dependent on the component's own type: a VTODO is judged on DUE and DURATION
 // as much as on DTSTART, and a VEVENT alone occupies an interval.
-func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, window *calendarTimeWindow) (bool, error) {
+func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, periods *periodIndex, window *calendarTimeWindow) (bool, error) {
 	current, err := compOverlaps(window.Start, window.End, ov)
 	if err != nil {
 		return false, fmt.Errorf("caldav: stored override holds an unreadable interval: %w", err)
@@ -82,9 +84,25 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, win
 	if master, ok := masters[propValue(ov, ical.PropUID)]; ok {
 		shape = master
 	}
-	original, err := recurrenceInstance(shape, rid)
+	original, err := originalInstance(shape, rid, periods)
 	if err != nil {
 		return false, err
 	}
 	return compOverlaps(window.Start, window.End, original)
+}
+
+// originalInstance materialises shape at rid, with the end of the RDATE period
+// that starts there when shape lists one.
+func originalInstance(shape *ical.Component, rid time.Time, periods *periodIndex) (*ical.Component, error) {
+	occ, found, err := periods.at(shape, rid)
+	if errors.Is(err, errTooManyRecurrenceDates) {
+		return nil, expansionOverflow()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("caldav: stored master holds an unreadable RDATE: %w", err)
+	}
+	if !found {
+		occ = occurrence{start: rid}
+	}
+	return recurrenceInstance(shape, occ)
 }

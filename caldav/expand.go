@@ -1,6 +1,7 @@
 package caldav
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -148,12 +149,12 @@ func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget
 	return out, nil
 }
 
-// recurrenceMaster is a component carrying a recurrence rule, paired with the
-// set it generates so the rule is only parsed once.
+// recurrenceMaster is a recurring component, paired with the set it generates
+// so the rule and dates are only parsed once.
 type recurrenceMaster struct {
 	comp *ical.Component
 	uid  string
-	set  recurrenceIterator
+	rec  *recurrence
 }
 
 type recurrenceIterator interface {
@@ -187,49 +188,49 @@ func partitionForExpansion(cal *ical.Calendar) (masters []recurrenceMaster, over
 			continue
 		}
 
-		set, derr := splitDateLists(child).RecurrenceSet(time.UTC)
+		rec, derr := recurrenceOf(child, time.UTC)
+		if errors.Is(derr, errTooManyRecurrenceDates) {
+			return nil, nil, nil, expansionOverflow()
+		}
 		if derr != nil {
 			return nil, nil, nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid recurrence rule")
 		}
-		if set == nil {
+		if rec == nil {
 			plain = append(plain, child)
 			continue
 		}
 		masters = append(masters, recurrenceMaster{
 			comp: child,
 			uid:  propValue(child, ical.PropUID),
-			set:  set,
+			rec:  rec,
 		})
 	}
 	return masters, overrides, plain, nil
 }
 
 func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map[string]*recurrenceOverride, consumed map[string]bool, emit func(*ical.Component) error) error {
-	compStart, compEnd, err := compInterval(master.comp, time.UTC)
+	extent, err := extentOf(master.comp, time.UTC)
 	if err != nil {
 		return internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid component interval")
 	}
-	duration := compEnd.Sub(compStart)
-
-	iter := master.set.Iterator()
-	// Occurrences increase, so the walk ends either when the rule runs out or
+	next := master.rec.iterator()
+	// Occurrences increase, so the walk ends either when the set runs out or
 	// when their starts pass the window. Reaching the iteration cap instead means
-	// the answer would be incomplete, which is worse than refusing. Each
-	// occurrence spans the master's duration, so one beginning before the window
-	// can still reach into it.
+	// the answer would be incomplete, which is worse than refusing. An occurrence
+	// beginning before the window can still reach into it.
 	for i := 0; i < maxRecurrenceIterations; i++ {
-		occ, ok := iter()
+		occ, ok := next()
 		if !ok {
 			return nil
 		}
-		if !occ.Before(req.End) {
+		if occ.start.After(req.End) {
 			return nil
 		}
-		if !intervalOverlaps(req.Start, req.End, occ, occ.Add(duration)) {
+		if !extent.overlaps(req.Start, req.End, occ) {
 			continue
 		}
 
-		key := overrideKey(master.uid, occ.UTC())
+		key := overrideKey(master.uid, occ.start.UTC())
 		if ov, found := byKey[key]; found {
 			consumed[key] = true
 			if err := emit(instanceTimesToUTC(cloneComponent(ov.comp))); err != nil {
@@ -246,47 +247,90 @@ func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map
 			return err
 		}
 	}
+	return expansionOverflow()
+}
+
+func expansionOverflow() error {
 	return internal.HTTPErrorf(http.StatusForbidden, "caldav: recurrence expansion exceeded %d iterations", maxRecurrenceIterations)
 }
 
+// recurrenceProps generate a set; an instance of it carries none of them.
+var recurrenceProps = map[string]bool{
+	ical.PropRecurrenceRule:  true,
+	ical.PropRecurrenceDates: true,
+	ical.PropExceptionDates:  true,
+	"EXRULE":                 true,
+}
+
 // recurrenceInstance materialises one occurrence of a recurring component: the
-// rule that generated it is removed, RECURRENCE-ID identifies it, and the
-// master's duration is carried across rather than its absolute end.
-func recurrenceInstance(master *ical.Component, occ time.Time) (*ical.Component, error) {
-	instance := cloneComponent(master)
-	for _, name := range []string{ical.PropRecurrenceRule, ical.PropRecurrenceDates, ical.PropExceptionDates, "EXRULE"} {
-		instance.Props.Del(name)
+// properties that generated it are dropped, RECURRENCE-ID identifies it, and
+// its start moves to the occurrence. An event's DTEND and a to-do's DUE move
+// with it, keeping the master's length, unless an RDATE period gives the
+// occurrence its own end. A DATE series stays DATE.
+func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component, error) {
+	instance := &ical.Component{Name: master.Name, Props: make(ical.Props, len(master.Props))}
+	for name, props := range master.Props {
+		if !recurrenceProps[name] {
+			instance.Props[name] = cloneProps(props)
+		}
+	}
+	for _, child := range master.Children {
+		instance.Children = append(instance.Children, cloneComponent(child))
 	}
 
-	var duration time.Duration
-	if master.Name == ical.CompEvent && master.Props.Get(ical.PropDateTimeEnd) != nil {
-		event := &ical.Event{Component: master}
-		start, err := event.DateTimeStart(time.UTC)
-		if err != nil {
-			return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid DTSTART")
-		}
-		end, err := event.DateTimeEnd(time.UTC)
-		if err != nil {
-			return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid DTEND")
-		}
-		duration = end.Sub(start)
+	startProp := master.Props.Get(ical.PropDateTimeStart)
+	allDay := isDate(startProp)
+	setInstant(instance.Props, ical.PropRecurrenceID, occ.start, allDay)
+	setInstant(instance.Props, ical.PropDateTimeStart, occ.start, allDay)
+
+	endName, ends := instanceEnds[master.Name]
+	if !ends {
+		return instance, nil
+	}
+	if occ.own {
+		instance.Props.Del(ical.PropDuration)
+		instance.Props.SetDateTime(endName, occ.end.UTC())
+		return instance, nil
 	}
 
-	occUTC := occ.UTC()
-	instance.Props.SetDateTime(ical.PropRecurrenceID, occUTC)
-	instance.Props.SetDateTime(ical.PropDateTimeStart, occUTC)
-	if duration != 0 {
-		instance.Props.SetDateTime(ical.PropDateTimeEnd, occUTC.Add(duration))
+	endProp := master.Props.Get(endName)
+	if endProp == nil || startProp == nil {
+		return instance, nil
 	}
+	start, err := startProp.DateTime(time.UTC)
+	if err != nil {
+		return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid DTSTART")
+	}
+	end, err := endProp.DateTime(time.UTC)
+	if err != nil {
+		return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid %s", endName)
+	}
+	setInstant(instance.Props, endName, occ.start.Add(end.Sub(start)), isDate(endProp))
 	return instance, nil
 }
 
+// instanceEnds names the property that ends an instance of each kind that has
+// one.
+var instanceEnds = map[string]string{
+	ical.CompEvent: ical.PropDateTimeEnd,
+	ical.CompToDo:  ical.PropDue,
+}
+
+func setInstant(props ical.Props, name string, t time.Time, date bool) {
+	if date {
+		props.SetDate(name, t.UTC())
+		return
+	}
+	props.SetDateTime(name, t.UTC())
+}
+
 // instanceTimesToUTC rewrites the absolute times of an already-materialised
-// component, so that a response carrying no VTIMEZONE stays self-describing.
+// component, so that a response carrying no VTIMEZONE stays self-describing. A
+// DATE names a day in no zone and is left as it is.
 func instanceTimesToUTC(comp *ical.Component) *ical.Component {
 	for _, name := range []string{ical.PropDateTimeStart, ical.PropDateTimeEnd, ical.PropRecurrenceID} {
 		prop := comp.Props.Get(name)
-		if prop == nil {
+		if prop == nil || isDate(prop) {
 			continue
 		}
 		t, err := prop.DateTime(time.UTC)
