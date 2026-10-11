@@ -281,7 +281,9 @@ var recurrenceProps = map[string]bool{
 // properties that generated it are dropped, RECURRENCE-ID identifies it, and
 // its start moves to the occurrence. An event's DTEND and a to-do's DUE move
 // with it, keeping the master's length, unless an RDATE period gives the
-// occurrence its own end. A DATE series stays DATE.
+// occurrence its own end. DTSTART and RECURRENCE-ID take the occurrence's own
+// value type, and an end stays a DATE only where both it and the occurrence
+// are, since a DATE cannot hold the master's length from another type's start.
 func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component, error) {
 	instance := &ical.Component{Name: master.Name, Props: make(ical.Props, len(master.Props))}
 	for name, props := range master.Props {
@@ -294,9 +296,8 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 	}
 
 	startProp := master.Props.Get(ical.PropDateTimeStart)
-	allDay := isDate(startProp)
-	setInstant(instance.Props, ical.PropRecurrenceID, occ.start, allDay)
-	setInstant(instance.Props, ical.PropDateTimeStart, occ.start, allDay)
+	setInstant(instance.Props, ical.PropRecurrenceID, occ.start, occ.date)
+	setInstant(instance.Props, ical.PropDateTimeStart, occ.start, occ.date)
 
 	endName, ends := instanceEnds[master.Name]
 	if !ends {
@@ -309,7 +310,11 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 	}
 
 	endProp := master.Props.Get(endName)
-	if endProp == nil || startProp == nil {
+	if startProp == nil {
+		return instance, nil
+	}
+	if endProp == nil {
+		impliedEnd(instance, master, occ)
 		return instance, nil
 	}
 	start, err := startProp.DateTime(time.UTC)
@@ -320,8 +325,23 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 	if err != nil {
 		return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid %s", endName)
 	}
-	setInstant(instance.Props, endName, occ.start.Add(end.Sub(start)), isDate(endProp))
+	setInstant(instance.Props, endName, occ.start.Add(end.Sub(start)), occ.date && isDate(endProp))
 	return instance, nil
+}
+
+// impliedEnd states the end of an event instance whose master leaves it to
+// DTSTART's type (RFC 5545 §3.6.1: a DATE lasts a day, a DATE-TIME an instant)
+// when the instance's start is of the other type and would imply another.
+func impliedEnd(instance, master *ical.Component, occ occurrence) {
+	allDay := isDate(master.Props.Get(ical.PropDateTimeStart))
+	if master.Name != ical.CompEvent || master.Props.Get(ical.PropDuration) != nil || occ.date == allDay {
+		return
+	}
+	end := occ.start
+	if allDay {
+		end = occ.start.AddDate(0, 0, 1)
+	}
+	instance.Props.SetDateTime(ical.PropDateTimeEnd, end.UTC())
 }
 
 // instanceEnds names the property that ends an instance of each kind that has

@@ -84,17 +84,17 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, per
 	if master, ok := masters[propValue(ov, ical.PropUID)]; ok {
 		shape = master
 	}
-	original, err := originalInstance(shape, rid, periods)
+	original, err := originalInstance(shape, occurrence{start: rid, date: isDate(ridProp)}, periods)
 	if err != nil {
 		return false, err
 	}
 	return compOverlaps(window.Start, window.End, original)
 }
 
-// originalInstance materialises shape at rid, with the end of the RDATE period
-// that starts there when shape lists one.
-func originalInstance(shape *ical.Component, rid time.Time, periods *periodIndex) (*ical.Component, error) {
-	occ, found, err := periods.at(shape, rid)
+// originalInstance materialises shape at the instance a RECURRENCE-ID names,
+// with the end of the RDATE period that starts there when shape lists one.
+func originalInstance(shape *ical.Component, named occurrence, periods *periodIndex) (*ical.Component, error) {
+	occ, found, err := periods.at(shape, named.start)
 	if errors.Is(err, errTooManyRecurrenceDates) {
 		return nil, expansionOverflow()
 	}
@@ -102,7 +102,7 @@ func originalInstance(shape *ical.Component, rid time.Time, periods *periodIndex
 		return nil, fmt.Errorf("caldav: stored master holds an unreadable RDATE: %w", err)
 	}
 	if !found {
-		occ = occurrence{start: rid}
+		occ = named
 	}
 	return recurrenceInstance(shape, occ)
 }

@@ -17,13 +17,12 @@ func recurringICS(lines string) string {
 // calendar data, and storing it would fail every later time-range query.
 func TestPutRefusesUnreadableRecurrence(t *testing.T) {
 	for name, lines := range map[string]string{
-		"RDATE":                              "RDATE:not-a-date\r\n",
-		"RRULE":                              "RRULE:FREQ=SOMETIMES\r\n",
-		"EXDATE":                             "RRULE:FREQ=DAILY\r\nEXDATE:not-a-date\r\n",
-		"period ending earlier":              "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T120000Z\r\n",
-		"zero-length period":                 "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T130000Z\r\n",
-		"zero-duration period":               "RDATE;VALUE=PERIOD:20260810T130000Z/PT0S\r\n",
-		"DATE-TIME series with a DATE RDATE": "RDATE;VALUE=DATE:20260810\r\n",
+		"RDATE":                 "RDATE:not-a-date\r\n",
+		"RRULE":                 "RRULE:FREQ=SOMETIMES\r\n",
+		"EXDATE":                "RRULE:FREQ=DAILY\r\nEXDATE:not-a-date\r\n",
+		"period ending earlier": "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T120000Z\r\n",
+		"zero-length period":    "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T130000Z\r\n",
+		"zero-duration period":  "RDATE;VALUE=PERIOD:20260810T130000Z/PT0S\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := handlerFor(t, newStore(t), caldav.Config{})
@@ -43,6 +42,11 @@ func TestPutAcceptsReadableRecurrence(t *testing.T) {
 	cases := map[string]string{
 		"RDATE, PERIOD and EXDATE": recurringICS("RRULE:FREQ=DAILY;COUNT=3\r\nRDATE:20260810T090000Z\r\n" +
 			"RDATE;VALUE=PERIOD:20260811T130000Z/PT2H,20260812T130000Z/20260812T150000Z\r\nEXDATE:20260802T090000Z\r\n"),
+		// RFC 5545 §3.8.5.2 ties RDATE's value type to nothing.
+		"DATE-TIME series with a DATE RDATE": recurringICS("RDATE;VALUE=DATE:20260810\r\n"),
+		"DATE series with DATE-TIME and PERIOD RDATEs": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n" +
+			"BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260801T000000Z\r\nDTSTART;VALUE=DATE:20260801\r\n" +
+			"RDATE:20260810T090000Z\r\nRDATE;VALUE=PERIOD:20260811T130000Z/PT2H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
 		// The zone is the object's own, which time.LoadLocation cannot serve.
 		"embedded zone": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n" +
 			"BEGIN:VTIMEZONE\r\nTZID:Test/Plus10\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\n" +

@@ -143,25 +143,76 @@ func TestAllDayInstancesStayDates(t *testing.T) {
 	})
 }
 
-// A DATE series with a DATE-TIME extra date, or the reverse, has no single
-// reading; it is refused as an unreadable recurrence rather than guessed at.
-func TestMixedDateAndDateTimeSetIsUnreadable(t *testing.T) {
-	for name, body := range map[string]string{
-		"DATE series, DATE-TIME RDATE": "DTSTART;VALUE=DATE:20260801\nRDATE:20260808T090000Z\n",
-		"DATE series, PERIOD RDATE":    "DTSTART;VALUE=DATE:20260801\nRDATE;VALUE=PERIOD:20260808T090000Z/PT1H\n",
-		"DATE-TIME series, DATE RDATE": "DTSTART:20260801T090000Z\nDTEND:20260801T100000Z\nRDATE;VALUE=DATE:20260808\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			cal := parseICS(t, eventICS("UID:mixed\n"+body))
+// RFC 5545 §3.8.5.2 lets each RDATE be a DATE, a DATE-TIME or a period,
+// whatever DTSTART is, so each is read by its own type: a DATE as midnight, and
+// the instance it yields carries that type on DTSTART and RECURRENCE-ID while
+// keeping the series' length.
+func TestMixedValueTypesAreReadEachByItsOwn(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		inside      span
+		outside     span
+		wantType    ical.ValueType
+		wantStart   string
+		wantEndType ical.ValueType
+		wantEnd     string
+	}{
+		{
+			name:        "DATE series, DATE-TIME RDATE",
+			body:        "DTSTART;VALUE=DATE:20260801\nDTEND;VALUE=DATE:20260802\nRDATE:20260808T090000Z\n",
+			inside:      span{at(2026, time.August, 9, 8, 0), at(2026, time.August, 9, 8, 30)},
+			outside:     span{at(2026, time.August, 8, 8, 0), at(2026, time.August, 8, 8, 30)},
+			wantType:    ical.ValueDateTime,
+			wantStart:   "20260808T090000Z",
+			wantEndType: ical.ValueDateTime,
+			wantEnd:     "20260809T090000Z",
+		},
+		{
+			name:        "DATE series without an end, DATE-TIME RDATE",
+			body:        "DTSTART;VALUE=DATE:20260801\nRDATE:20260808T090000Z\n",
+			inside:      span{at(2026, time.August, 9, 8, 0), at(2026, time.August, 9, 8, 30)},
+			outside:     span{at(2026, time.August, 8, 8, 0), at(2026, time.August, 8, 8, 30)},
+			wantType:    ical.ValueDateTime,
+			wantStart:   "20260808T090000Z",
+			wantEndType: ical.ValueDateTime,
+			wantEnd:     "20260809T090000Z",
+		},
+		{
+			name:        "DATE series, PERIOD RDATE",
+			body:        "DTSTART;VALUE=DATE:20260801\nDTEND;VALUE=DATE:20260802\nRDATE;VALUE=PERIOD:20260808T090000Z/PT1H\n",
+			inside:      span{at(2026, time.August, 8, 9, 15), at(2026, time.August, 8, 9, 30)},
+			outside:     span{at(2026, time.August, 8, 11, 0), at(2026, time.August, 8, 12, 0)},
+			wantType:    ical.ValueDateTime,
+			wantStart:   "20260808T090000Z",
+			wantEndType: ical.ValueDateTime,
+			wantEnd:     "20260808T100000Z",
+		},
+		{
+			name:        "DATE-TIME series, DATE RDATE",
+			body:        "DTSTART:20260801T090000Z\nDTEND:20260801T100000Z\nRDATE;VALUE=DATE:20260808\n",
+			inside:      span{at(2026, time.August, 8, 0, 15), at(2026, time.August, 8, 0, 30)},
+			outside:     span{at(2026, time.August, 8, 9, 15), at(2026, time.August, 8, 9, 30)},
+			wantType:    ical.ValueDate,
+			wantStart:   "20260808",
+			wantEndType: ical.ValueDateTime,
+			wantEnd:     "20260808T010000Z",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cal := parseICS(t, eventICS("UID:mixed\n"+tc.body))
 
-			if _, err := match(vevent(ical.CompEvent, at(2026, time.August, 1, 0, 0), at(2026, time.September, 1, 0, 0)), cal.Component); err == nil {
-				t.Error("match accepted a mixed set")
+			if !matchesWindow(t, cal, tc.inside.start, tc.inside.end) {
+				t.Error("a window inside the extra date's instance did not match")
 			}
-			_, err := expandCalendar(cal, &calendarExpandRequest{Start: at(2026, time.August, 1, 0, 0), End: at(2026, time.September, 1, 0, 0)})
-			var httpErr *internal.HTTPError
-			if !errors.As(err, &httpErr) || httpErr.Code != http.StatusForbidden {
-				t.Errorf("expand err = %v, want 403", err)
+			if matchesWindow(t, cal, tc.outside.start, tc.outside.end) {
+				t.Error("a window outside the extra date's instance matched")
 			}
+			ev := expandOne(t, cal, ical.CompEvent, at(2026, time.August, 8, 0, 0), at(2026, time.August, 8, 12, 0))
+			assertProp(t, ev, ical.PropDateTimeStart, tc.wantType, tc.wantStart)
+			assertProp(t, ev, ical.PropRecurrenceID, tc.wantType, tc.wantStart)
+			assertProp(t, ev, ical.PropDateTimeEnd, tc.wantEndType, tc.wantEnd)
 		})
 	}
 }
@@ -258,5 +309,22 @@ func TestLimitRecurrenceSetChargesEveryMasterToOneBudget(t *testing.T) {
 	var httpErr *internal.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.Code != http.StatusForbidden || !strings.Contains(err.Error(), "iterations") {
 		t.Errorf("err = %v, want 403 naming the iteration cap", err)
+	}
+}
+
+// RFC 4791 §9.6.6 judges an override on its original time, which for a DATE
+// VJOURNAL is the whole day its RECURRENCE-ID names.
+func TestLimitRecurrenceSetJudgesADateJournalOverrideOnItsDay(t *testing.T) {
+	cal := parseICS(t, componentICS(ical.CompJournal,
+		"UID:journal\nDTSTART;VALUE=DATE:20260801\nRRULE:FREQ=WEEKLY;COUNT=3\n",
+		"UID:journal\nRECURRENCE-ID;VALUE=DATE:20260808\nDTSTART;VALUE=DATE:20260901\nSUMMARY:Moved\n",
+	))
+
+	out, err := limitRecurrenceCalendar(cal, &calendarTimeWindow{Start: at(2026, time.August, 8, 12, 0), End: at(2026, time.August, 8, 13, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(componentsNamed(out, ical.CompJournal)); got != 2 {
+		t.Errorf("components = %d, want the master and the override whose original day covers the window", got)
 	}
 }

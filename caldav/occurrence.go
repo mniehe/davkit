@@ -20,9 +20,11 @@ const periodSeparator = "/"
 
 // occurrence is one instance of a recurrence set. own marks an end stated by
 // an RDATE period; any other occurrence takes its extent from the component.
+// date marks a start written as a DATE, which need not match DTSTART's type
+// when it comes from an RDATE.
 type occurrence struct {
 	start, end time.Time
-	own        bool
+	own, date  bool
 }
 
 // recurrence is a component's recurrence set per RFC 5545 §3.8.5: DTSTART and
@@ -31,6 +33,8 @@ type occurrence struct {
 // RRULE and cannot read an RDATE period.
 type recurrence struct {
 	starts func() func() (time.Time, bool)
+	// allDay marks the starts as DATEs, as DTSTART is.
+	allDay bool
 	// dates are the RDATE occurrences, ascending, one per start, with EXDATE
 	// already applied.
 	dates []occurrence
@@ -49,7 +53,7 @@ func recurrenceOf(comp *ical.Component, loc *time.Location) (*recurrence, error)
 		return nil, errTooManyRecurrenceDates
 	}
 
-	rec := &recurrence{}
+	rec := &recurrence{allDay: isDate(split.Props.Get(ical.PropDateTimeStart))}
 	if hasRule {
 		ruleOnly := *split
 		ruleOnly.Props = maps.Clone(split.Props)
@@ -108,7 +112,7 @@ func (r *recurrence) iterator() func() (occurrence, bool) {
 			if !more {
 				return occurrence{}, false
 			}
-			occ := occurrence{start: next}
+			occ := occurrence{start: next, date: r.allDay}
 			next, more = starts()
 			return occ, true
 		}
@@ -131,10 +135,9 @@ func recurrenceDates(split *ical.Component, loc *time.Location) ([]occurrence, e
 		return nil, errTooManyRecurrenceDates
 	}
 
-	allDay := isDate(split.Props.Get(ical.PropDateTimeStart))
 	dates := make([]occurrence, 0, len(props))
 	for i := range props {
-		d, err := recurrenceDate(&props[i], loc, allDay)
+		d, err := recurrenceDate(&props[i], loc)
 		if err != nil {
 			return nil, err
 		}
@@ -167,22 +170,17 @@ func isDate(prop *ical.Prop) bool {
 	return prop != nil && prop.ValueType() == ical.ValueDate
 }
 
-// recurrenceDate reads one RDATE value of a series whose DTSTART is a DATE
-// when allDay. A value of the other type, a period among them, has no reading
-// in that series, so it is refused rather than guessed at. A period is
+// recurrenceDate reads one RDATE value by its own type, which RFC 5545
+// §3.8.5.2 does not tie to DTSTART's: a DATE is midnight in loc. A period is
 // recognised by its separator rather than by VALUE=PERIOD, because
 // resolveObjectTimes rewrites a zoned period to UTC and marks it DATE-TIME.
-func recurrenceDate(prop *ical.Prop, loc *time.Location, allDay bool) (occurrence, error) {
-	isPeriod := strings.Contains(prop.Value, periodSeparator)
-	if allDay != (isDate(prop) && !isPeriod) {
-		return occurrence{}, fmt.Errorf("caldav: RDATE %q is not the same value type as DTSTART", prop.Value)
-	}
-	if !isPeriod {
+func recurrenceDate(prop *ical.Prop, loc *time.Location) (occurrence, error) {
+	if !strings.Contains(prop.Value, periodSeparator) {
 		start, err := prop.DateTime(loc)
 		if err != nil {
 			return occurrence{}, fmt.Errorf("caldav: invalid RDATE %q: %w", prop.Value, err)
 		}
-		return occurrence{start: start}, nil
+		return occurrence{start: start, date: isDate(prop)}, nil
 	}
 
 	if tzid := prop.Params.Get(ical.ParamTimezoneID); tzid != "" {
