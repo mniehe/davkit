@@ -465,11 +465,14 @@ func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden 
 			// Occurrences only increase, so none remain in range.
 			return false, nil
 		}
-		if overridden[overrideKey(uid, occ.start)] {
-			continue
-		}
-		if extent.overlaps(start, end, occ) {
+		if !overridden[overrideKey(uid, occ.start)] && extent.overlaps(start, end, occ) {
 			return true, nil
+		}
+		// Only a VTODO can match an occurrence starting on the end, and this
+		// one has been tested; a later one cannot, so asking for it would only
+		// spend the iteration cap.
+		if occ.start.Equal(end) {
+			return false, nil
 		}
 	}
 	// Answering true here would return data the filter excluded: nothing has been

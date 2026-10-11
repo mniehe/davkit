@@ -226,32 +226,36 @@ func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map
 		if occ.start.After(req.End) {
 			return nil
 		}
-
-		// An override replaces the occurrence wherever it moved it, so it is
-		// judged on its own time, and claimed even when the original time is
-		// outside the window so the pass over unclaimed overrides skips it.
-		key := overrideKey(master.uid, occ.start)
-		if ov, found := byKey[key]; found {
-			consumed[key] = true
-			if err := emitOverride(ov, req, emit); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if !extent.overlaps(req.Start, req.End, occ) {
-			continue
-		}
-
-		instance, err := recurrenceInstance(master.comp, occ)
-		if err != nil {
+		if err := expandOccurrence(master, &extent, occ, req, byKey, consumed, emit); err != nil {
 			return err
 		}
-		if err := emit(instance); err != nil {
-			return err
+		// An occurrence starting on the end has been tested and a later one
+		// cannot overlap, so asking for it would only spend the iteration cap.
+		if occ.start.Equal(req.End) {
+			return nil
 		}
 	}
 	return expansionOverflow()
+}
+
+func expandOccurrence(master recurrenceMaster, extent *occurrenceExtent, occ occurrence, req *calendarExpandRequest, byKey map[string]*recurrenceOverride, consumed map[string]bool, emit func(*ical.Component) error) error {
+	// An override replaces the occurrence wherever it moved it, so it is
+	// judged on its own time, and claimed even when the original time is
+	// outside the window so the pass over unclaimed overrides skips it.
+	key := overrideKey(master.uid, occ.start)
+	if ov, found := byKey[key]; found {
+		consumed[key] = true
+		return emitOverride(ov, req, emit)
+	}
+
+	if !extent.overlaps(req.Start, req.End, occ) {
+		return nil
+	}
+	instance, err := recurrenceInstance(master.comp, occ)
+	if err != nil {
+		return err
+	}
+	return emit(instance)
 }
 
 func emitOverride(ov *recurrenceOverride, req *calendarExpandRequest, emit func(*ical.Component) error) error {

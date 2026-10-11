@@ -370,3 +370,25 @@ func TestLimitRecurrenceSetChargesExceptionDatesToTheBudget(t *testing.T) {
 		t.Errorf("err = %v, want 403 naming the iteration cap", err)
 	}
 }
+
+// The window is half-open (RFC 4791 §9.9), so an event starting exactly at its
+// end is outside it and the walk has nothing left to ask for. Asking anyway
+// would spend the last of the iteration cap on an occurrence that cannot
+// match, turning a plain miss into an overflow.
+func TestWalkStopsAtAnOccurrenceOnTheWindowsEnd(t *testing.T) {
+	cal := parseICS(t, eventICS(fmt.Sprintf("UID:minutely\nDTSTART:20260101T000000Z\nDTEND:20260101T000030Z\nRRULE:FREQ=MINUTELY;COUNT=%d\n", maxRecurrenceIterations)))
+	last := at(2026, time.January, 1, 0, 0).Add(time.Duration(maxRecurrenceIterations-1) * time.Minute)
+	from, to := last.Add(-20*time.Second), last
+
+	ok, err := match(vevent(ical.CompEvent, from, to), cal.Component)
+	if err != nil || ok {
+		t.Errorf("match = %v, %v; want false with no error", ok, err)
+	}
+	out, err := expandCalendar(cal, &calendarExpandRequest{Start: from, End: to})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if got := componentsNamed(out, ical.CompEvent); len(got) != 0 {
+		t.Errorf("expanded %d instances, want none", len(got))
+	}
+}
