@@ -217,8 +217,9 @@ func exceptionDates(split *ical.Component, loc *time.Location) (map[int64]bool, 
 	return excluded, nil
 }
 
-// periodIndex holds the RDATE periods of an object's masters, each read once
-// however many overrides consult it, and all charged to one budget.
+// periodIndex holds the RDATE periods of an object's masters, EXDATE applied,
+// each read once however many overrides consult it, and all charged to one
+// budget.
 type periodIndex struct {
 	byUID  map[string][]occurrence
 	budget int
@@ -233,15 +234,8 @@ func (p *periodIndex) at(master *ical.Component, start time.Time) (occurrence, b
 	uid := propValue(master, ical.PropUID)
 	dates, read := p.byUID[uid]
 	if !read {
-		split := splitDateLists(master)
-		listed := len(split.Props[ical.PropRecurrenceDates])
-		if listed > p.budget {
-			return occurrence{}, false, errTooManyRecurrenceDates
-		}
-		p.budget -= listed
-
 		var err error
-		if dates, err = recurrenceDates(split, time.UTC); err != nil {
+		if dates, err = p.read(master); err != nil {
 			return occurrence{}, false, err
 		}
 		p.byUID[uid] = dates
@@ -252,4 +246,23 @@ func (p *periodIndex) at(master *ical.Component, start time.Time) (occurrence, b
 		return occurrence{}, false, nil
 	}
 	return dates[i], true, nil
+}
+
+func (p *periodIndex) read(master *ical.Component) ([]occurrence, error) {
+	split := splitDateLists(master)
+	listed := len(split.Props[ical.PropRecurrenceDates]) + len(split.Props[ical.PropExceptionDates])
+	if listed > p.budget {
+		return nil, errTooManyRecurrenceDates
+	}
+	p.budget -= listed
+
+	excluded, err := exceptionDates(split, time.UTC)
+	if err != nil {
+		return nil, err
+	}
+	dates, err := recurrenceDates(split, time.UTC)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(dates, func(d occurrence) bool { return excluded[d.start.Unix()] }), nil
 }

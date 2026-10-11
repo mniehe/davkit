@@ -328,3 +328,45 @@ func TestLimitRecurrenceSetJudgesADateJournalOverrideOnItsDay(t *testing.T) {
 		t.Errorf("components = %d, want the master and the override whose original day covers the window", got)
 	}
 }
+
+// An EXDATE removes a period from the set (RFC 5545 §3.8.5.1), so it cannot
+// shape the original time of an override at that start either.
+func TestLimitRecurrenceSetIgnoresAnExcludedPeriod(t *testing.T) {
+	cal := parseICS(t, eventICS(
+		"UID:lim\nDTSTART:20260801T090000Z\nDTEND:20260801T100000Z\nRDATE;VALUE=PERIOD:20260810T130000Z/PT4H\nEXDATE:20260810T130000Z\n",
+		"UID:lim\nRECURRENCE-ID:20260810T130000Z\nDTSTART:20260901T090000Z\nDTEND:20260901T100000Z\nSUMMARY:Moved\n",
+	))
+
+	// 15:00 is reached only by the excluded period's end, not by the master's
+	// own hour from 13:00.
+	out, err := limitRecurrenceCalendar(cal, &calendarTimeWindow{Start: at(2026, time.August, 10, 15, 0), End: at(2026, time.August, 10, 16, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(componentsNamed(out, ical.CompEvent)); got != 1 {
+		t.Errorf("components = %d, want the master alone", got)
+	}
+}
+
+// Reading a master's EXDATE list is work too, charged to the same budget.
+func TestLimitRecurrenceSetChargesExceptionDatesToTheBudget(t *testing.T) {
+	half := maxRecurrenceIterations/2 + 1
+	values := make([]string, half)
+	for i := range values {
+		values[i] = at(2026, time.January, 1, 9, 0).Add(time.Duration(i) * time.Minute).Format(dateWithUTCTimeLayout)
+	}
+	list := strings.Join(values, ",")
+	bodies := make([]string, 0, 4)
+	for _, uid := range []string{"a", "b"} {
+		bodies = append(bodies,
+			"UID:"+uid+"\nDTSTART:20260101T090000Z\nDTEND:20260101T100000Z\nRDATE:20280101T090000Z\nEXDATE:"+list+"\n",
+			"UID:"+uid+"\nRECURRENCE-ID:20280101T090000Z\nDTSTART:20290101T090000Z\nDTEND:20290101T100000Z\n")
+	}
+	cal := parseICS(t, eventICS(bodies...))
+
+	_, err := limitRecurrenceCalendar(cal, &calendarTimeWindow{Start: at(2030, time.January, 1, 0, 0), End: at(2030, time.January, 2, 0, 0)})
+	var httpErr *internal.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Code != http.StatusForbidden || !strings.Contains(err.Error(), "iterations") {
+		t.Errorf("err = %v, want 403 naming the iteration cap", err)
+	}
+}

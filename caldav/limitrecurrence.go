@@ -99,7 +99,7 @@ func originalInstance(shape *ical.Component, named occurrence, periods *periodIn
 		return nil, expansionOverflow()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("caldav: stored master holds an unreadable RDATE: %w", err)
+		return nil, fmt.Errorf("caldav: stored master holds an unreadable RDATE or EXDATE: %w", err)
 	}
 	if !found {
 		occ = named
