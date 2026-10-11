@@ -105,10 +105,7 @@ func matchCompFilter(filter *compFilter, comp *ical.Component) (bool, error) {
 
 	var overridden map[string]bool
 	if hasTimeRange(filter) {
-		var err error
-		if overridden, err = overrideKeys(comp.Children, filter.Start.Location()); err != nil {
-			return false, err
-		}
+		overridden = overrideKeys(comp.Children, filter.Start.Location())
 	}
 	for _, child := range comp.Children {
 		ok, err := matchAmong(filter, child, overridden)
@@ -128,8 +125,9 @@ func hasTimeRange(filter *compFilter) bool {
 
 // overrideKeys names the instances that children carrying RECURRENCE-ID
 // redefine (RFC 5545 §3.8.4.4). Such an instance is no longer where its series
-// would put it, so a walk over the series must not find it there.
-func overrideKeys(children []*ical.Component, loc *time.Location) (map[string]bool, error) {
+// would put it, so a walk over the series must not find it there. A
+// RECURRENCE-ID that does not read names no instance, so it takes none away.
+func overrideKeys(children []*ical.Component, loc *time.Location) map[string]bool {
 	var keys map[string]bool
 	for _, child := range children {
 		prop := child.Props.Get(ical.PropRecurrenceID)
@@ -138,14 +136,14 @@ func overrideKeys(children []*ical.Component, loc *time.Location) (map[string]bo
 		}
 		rid, err := prop.DateTime(loc)
 		if err != nil {
-			return nil, fmt.Errorf("caldav: invalid RECURRENCE-ID %q: %w", prop.Value, err)
+			continue
 		}
 		if keys == nil {
 			keys = make(map[string]bool)
 		}
 		keys[overrideKey(propValue(child, ical.PropUID), rid)] = true
 	}
-	return keys, nil
+	return keys
 }
 
 func matchPropFilter(filter *propFilter, comp *ical.Component) (bool, error) {

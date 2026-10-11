@@ -23,6 +23,7 @@ func TestPutRefusesUnreadableRecurrence(t *testing.T) {
 		"period ending earlier": "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T120000Z\r\n",
 		"zero-length period":    "RDATE;VALUE=PERIOD:20260810T130000Z/20260810T130000Z\r\n",
 		"zero-duration period":  "RDATE;VALUE=PERIOD:20260810T130000Z/PT0S\r\n",
+		"RECURRENCE-ID":         "RECURRENCE-ID:not-a-date\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := handlerFor(t, newStore(t), caldav.Config{})

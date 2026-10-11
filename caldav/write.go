@@ -101,9 +101,9 @@ func parseItemBody(body []byte) (parsedItem, error) {
 	return item, nil
 }
 
-// recurrenceReadable reports whether every component's RRULE, RDATE and
-// EXDATE read the way the matcher and the expander will read them, so that
-// storing the object cannot fail every later time-range query on its calendar.
+// recurrenceReadable reports whether every component's RRULE, RDATE, EXDATE
+// and RECURRENCE-ID read the way the matcher and the expander will read them,
+// so that storing the object cannot fail every later query on its calendar.
 // A set too large for those walks to finish is refused for the same reason.
 func recurrenceReadable(cal *ical.Calendar) bool {
 	resolved, err := resolveObjectTimes(cal, nil)
@@ -116,6 +116,11 @@ func recurrenceReadable(cal *ical.Calendar) bool {
 		}
 		if _, err := recurrenceOf(comp, time.UTC); err != nil {
 			return false
+		}
+		if rid := comp.Props.Get(ical.PropRecurrenceID); rid != nil {
+			if _, err := rid.DateTime(time.UTC); err != nil {
+				return false
+			}
 		}
 	}
 	return true
