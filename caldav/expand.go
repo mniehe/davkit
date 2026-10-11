@@ -231,7 +231,7 @@ func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map
 		}
 		// An occurrence starting on the end has been tested and a later one
 		// cannot overlap, so asking for it would only spend the iteration cap.
-		if occ.start.Equal(req.End) {
+		if !req.End.IsZero() && occ.start.Equal(req.End) {
 			return nil
 		}
 	}

@@ -469,7 +469,7 @@ func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden 
 		// Only a VTODO can match an occurrence starting on the end, and this
 		// one has been tested; a later one cannot, so asking for it would only
 		// spend the iteration cap.
-		if occ.start.Equal(end) {
+		if !end.IsZero() && occ.start.Equal(end) {
 			return false, nil
 		}
 	}

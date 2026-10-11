@@ -265,3 +265,31 @@ func componentCalendar(name string, bodies ...string) string {
 	}
 	return ics + "END:VCALENDAR\r\n"
 }
+
+// 00010101T000000Z is the instant Go's zero time names, so an occurrence there
+// must not be taken for the end of a window that has none.
+func TestAnOccurrenceAtTheZeroInstantDoesNotEndAnOpenWalk(t *testing.T) {
+	runCrossPaths(t, &crossPaths{
+		comp: ical.CompEvent,
+		ics:  eventCalendar("UID:fixture\r\nSUMMARY:Ancient\r\nDTSTART:00010101T000000Z\r\nDTEND:00010101T010000Z\r\nRDATE:00020101T000000Z\r\n"),
+		put:  http.StatusCreated,
+		queries: []crossQuery{
+			{crossWindow{"00011231T000000Z", ""}, true},
+			{crossWindow{"00030101T000000Z", ""}, false},
+			{crossWindow{"00011231T000000Z", "00020101T000000Z"}, false},
+		},
+		expand:       crossWindow{"00011231T000000Z", "00030101T000000Z"},
+		expandStatus: http.StatusMultiStatus,
+		instances: []crossInstance{{
+			ical.PropDateTimeStart: "DATE-TIME:00020101T000000Z",
+			ical.PropRecurrenceID:  "DATE-TIME:00020101T000000Z",
+			ical.PropDateTimeEnd:   "DATE-TIME:00020101T010000Z",
+		}},
+		freeBusy:       crossWindow{"00011231T000000Z", "00030101T000000Z"},
+		freeBusyStatus: http.StatusOK,
+		busy:           []string{"00020101T000000Z/00020101T010000Z"},
+		limits: []crossLimit{
+			{crossWindow{"00011231T000000Z", "00030101T000000Z"}, http.StatusMultiStatus, []string{"Ancient"}},
+		},
+	})
+}
