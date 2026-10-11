@@ -226,16 +226,20 @@ func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map
 		if occ.start.After(req.End) {
 			return nil
 		}
-		if !extent.overlaps(req.Start, req.End, occ) {
+
+		// An override replaces the occurrence wherever it moved it, so it is
+		// judged on its own time, and claimed even when the original time is
+		// outside the window so the pass over unclaimed overrides skips it.
+		key := overrideKey(master.uid, occ.start)
+		if ov, found := byKey[key]; found {
+			consumed[key] = true
+			if err := emitOverride(ov, req, emit); err != nil {
+				return err
+			}
 			continue
 		}
 
-		key := overrideKey(master.uid, occ.start.UTC())
-		if ov, found := byKey[key]; found {
-			consumed[key] = true
-			if err := emit(instanceTimesToUTC(cloneComponent(ov.comp))); err != nil {
-				return err
-			}
+		if !extent.overlaps(req.Start, req.End, occ) {
 			continue
 		}
 
@@ -248,6 +252,17 @@ func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map
 		}
 	}
 	return expansionOverflow()
+}
+
+func emitOverride(ov *recurrenceOverride, req *calendarExpandRequest, emit func(*ical.Component) error) error {
+	overlaps, err := compOverlaps(req.Start, req.End, ov.comp)
+	if err != nil {
+		return internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid override interval")
+	}
+	if !overlaps {
+		return nil
+	}
+	return emit(instanceTimesToUTC(cloneComponent(ov.comp)))
 }
 
 func expansionOverflow() error {

@@ -61,3 +61,28 @@ func TestFreeBusyReportsAllDayOccurrences(t *testing.T) {
 		})
 	}
 }
+
+// RFC 4791 §7.10 reports an overridden instance at the time the override gives
+// it, not at the time the series would have.
+func TestFreeBusyReportsAMovedOccurrenceAtItsNewTime(t *testing.T) {
+	store := newStore(t)
+	ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:moved\r\nDTSTAMP:20260801T000000Z\r\nDTSTART:20260801T090000Z\r\nDTEND:20260801T100000Z\r\n" +
+		"RDATE;VALUE=PERIOD:20260810T130000Z/PT4H\r\nEND:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:moved\r\nDTSTAMP:20260801T000000Z\r\nRECURRENCE-ID:20260810T130000Z\r\n" +
+		"DTSTART:20260812T090000Z\r\nDTEND:20260812T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	seedRaw(t, store, "alice", "moved.ics", ics, "moved")
+	h := handlerFor(t, store, caldav.Config{})
+
+	w := report(t, h, "/alice/work/", freeBusyQuery("20260805T000000Z", "20260901T000000Z"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d\n%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "FREEBUSY:20260812T090000Z/20260812T100000Z") {
+		t.Errorf("body missing the moved occurrence at its new time:\n%s", body)
+	}
+	if got := strings.Count(body, "FREEBUSY:"); got != 1 {
+		t.Errorf("body has %d FREEBUSY properties, want only the moved occurrence:\n%s", got, body)
+	}
+}

@@ -58,12 +58,18 @@ func matchObject(query *compFilter, co *calendarObject) (matched bool, err error
 // handled at the parent by matchCompFilter. A name mismatch is likewise a
 // plain non-match, never a positive result.
 func match(filter *compFilter, comp *ical.Component) (bool, error) {
+	return matchAmong(filter, comp, nil)
+}
+
+// matchAmong is match for a component whose siblings may override some of its
+// occurrences; overridden holds their overrideKey values.
+func matchAmong(filter *compFilter, comp *ical.Component, overridden map[string]bool) (bool, error) {
 	if comp.Name != filter.Name || filter.IsNotDefined {
 		return false, nil
 	}
 
-	if !filter.Start.IsZero() || !filter.End.IsZero() {
-		ok, err := matchCompTimeRange(filter.Start, filter.End, comp)
+	if hasTimeRange(filter) {
+		ok, err := matchTimeRangeAmong(filter.Start, filter.End, comp, overridden)
 		if err != nil || !ok {
 			return false, err
 		}
@@ -97,8 +103,15 @@ func matchCompFilter(filter *compFilter, comp *ical.Component) (bool, error) {
 		return true, nil
 	}
 
+	var overridden map[string]bool
+	if hasTimeRange(filter) {
+		var err error
+		if overridden, err = overrideKeys(comp.Children, filter.Start.Location()); err != nil {
+			return false, err
+		}
+	}
 	for _, child := range comp.Children {
-		ok, err := match(filter, child)
+		ok, err := matchAmong(filter, child, overridden)
 		if err != nil {
 			return false, err
 		}
@@ -107,6 +120,32 @@ func matchCompFilter(filter *compFilter, comp *ical.Component) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func hasTimeRange(filter *compFilter) bool {
+	return !filter.Start.IsZero() || !filter.End.IsZero()
+}
+
+// overrideKeys names the instances that children carrying RECURRENCE-ID
+// redefine (RFC 5545 §3.8.4.4). Such an instance is no longer where its series
+// would put it, so a walk over the series must not find it there.
+func overrideKeys(children []*ical.Component, loc *time.Location) (map[string]bool, error) {
+	var keys map[string]bool
+	for _, child := range children {
+		prop := child.Props.Get(ical.PropRecurrenceID)
+		if prop == nil {
+			continue
+		}
+		rid, err := prop.DateTime(loc)
+		if err != nil {
+			return nil, fmt.Errorf("caldav: invalid RECURRENCE-ID %q: %w", prop.Value, err)
+		}
+		if keys == nil {
+			keys = make(map[string]bool)
+		}
+		keys[overrideKey(propValue(child, ical.PropUID), rid)] = true
+	}
+	return keys, nil
 }
 
 func matchPropFilter(filter *propFilter, comp *ical.Component) (bool, error) {
@@ -386,6 +425,12 @@ func compOverlaps(start, end time.Time, comp *ical.Component) (bool, error) {
 }
 
 func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error) {
+	return matchTimeRangeAmong(start, end, comp, nil)
+}
+
+// matchTimeRangeAmong is matchCompTimeRange skipping the occurrences named in
+// overridden, which siblings of comp redefine.
+func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden map[string]bool) (bool, error) {
 	// See https://datatracker.ietf.org/doc/html/rfc4791#section-9.9
 
 	rec, err := recurrenceOf(comp, start.Location())
@@ -409,6 +454,7 @@ func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error
 
 	// An occurrence beginning before the window can still reach into it, and a
 	// VTODO's inclusive rows can reach one starting exactly at its end.
+	uid := propValue(comp, ical.PropUID)
 	next := rec.iterator()
 	for n := 0; n < maxRecurrenceIterations; n++ {
 		occ, ok := next()
@@ -418,6 +464,9 @@ func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error
 		if !end.IsZero() && occ.start.After(end) {
 			// Occurrences only increase, so none remain in range.
 			return false, nil
+		}
+		if overridden[overrideKey(uid, occ.start)] {
+			continue
 		}
 		if extent.overlaps(start, end, occ) {
 			return true, nil
