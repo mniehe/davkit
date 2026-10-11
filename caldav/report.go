@@ -145,7 +145,7 @@ func dataRequestFrom(prop *internal.Prop) (calendarCompRequest, error) {
 func shape(obj reportObject, req *calendarCompRequest, budget *expansionBudget) (reportObject, error) {
 	shaped := obj.data
 	if req.Expand != nil {
-		expanded, err := expandCalendarWithin(shaped, req.Expand, budget)
+		expanded, err := expandCalendarWithin(shaped, req.Expand, budget, forReport)
 		if err != nil {
 			return reportObject{}, err
 		}

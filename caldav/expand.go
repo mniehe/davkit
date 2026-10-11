@@ -69,12 +69,24 @@ func componentSize(comp *ical.Component) int {
 // expand identically. A Backend must therefore return unexpanded data and leave
 // CalendarCompRequest.Expand alone.
 func expandCalendar(cal *ical.Calendar, req *calendarExpandRequest) (*ical.Calendar, error) {
-	return expandCalendarWithin(cal, req, newExpansionBudget())
+	return expandCalendarWithin(cal, req, newExpansionBudget(), forReport)
 }
+
+// expansionUse says what the instances an expansion yields are for.
+type expansionUse int
+
+const (
+	// forReport writes the instances out, so each must be a component RFC
+	// 5545 allows.
+	forReport expansionUse = iota
+	// forBusyTime reads only the time each instance occupies and discards
+	// the components.
+	forBusyTime
+)
 
 // expandCalendarWithin draws from a budget the caller owns, so one REPORT
 // expanding many objects is bounded by its total rather than per object.
-func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget *expansionBudget) (*ical.Calendar, error) {
+func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget *expansionBudget, use expansionUse) (*ical.Calendar, error) {
 	// An object may carry its zones as embedded VTIMEZONEs that time.LoadLocation
 	// cannot serve; resolving them to UTC up front lets the expansion below read
 	// every time the same way. The result is UTC regardless, so normalising the
@@ -96,7 +108,7 @@ func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget
 		return nil
 	}
 
-	masters, overrides, plain, err := partitionForExpansion(cal)
+	masters, overrides, plain, err := partitionForExpansion(cal, use)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +181,7 @@ type recurrenceOverride struct {
 	recurrenceID time.Time
 }
 
-func partitionForExpansion(cal *ical.Calendar) (masters []recurrenceMaster, overrides []recurrenceOverride, plain []*ical.Component, err error) {
+func partitionForExpansion(cal *ical.Calendar, use expansionUse) (masters []recurrenceMaster, overrides []recurrenceOverride, plain []*ical.Component, err error) {
 	for _, child := range cal.Children {
 		if child.Name == ical.CompTimezone {
 			continue
@@ -198,6 +210,9 @@ func partitionForExpansion(cal *ical.Calendar) (masters []recurrenceMaster, over
 		if rec == nil {
 			plain = append(plain, child)
 			continue
+		}
+		if use == forReport && rec.timedOnAllDay() {
+			return nil, nil, nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: an all-day series lists a time of day no DATE RECURRENCE-ID can name")
 		}
 		masters = append(masters, recurrenceMaster{
 			comp: child,
@@ -285,9 +300,10 @@ var recurrenceProps = map[string]bool{
 // properties that generated it are dropped, RECURRENCE-ID identifies it, and
 // its start moves to the occurrence. An event's DTEND and a to-do's DUE move
 // with it, keeping the master's length, unless an RDATE period gives the
-// occurrence its own end. DTSTART and RECURRENCE-ID take the occurrence's own
-// value type, and an end stays a DATE only where both it and the occurrence
-// are, since a DATE cannot hold the master's length from another type's start.
+// occurrence its own end. RECURRENCE-ID, DTSTART and the end all take the
+// master's DTSTART value type (RFC 5545 §3.8.4.4, §3.8.2.2, §3.8.2.3), except
+// for a time of day on an all-day series, which only free-busy expands and
+// which no DATE can hold.
 func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component, error) {
 	instance := &ical.Component{Name: master.Name, Props: make(ical.Props, len(master.Props))}
 	for name, props := range master.Props {
@@ -300,8 +316,10 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 	}
 
 	startProp := master.Props.Get(ical.PropDateTimeStart)
-	setInstant(instance.Props, ical.PropRecurrenceID, occ.start, occ.date)
-	setInstant(instance.Props, ical.PropDateTimeStart, occ.start, occ.date)
+	allDay := isDate(startProp)
+	date := allDay && occ.date
+	setInstant(instance.Props, ical.PropRecurrenceID, occ.start, date)
+	setInstant(instance.Props, ical.PropDateTimeStart, occ.start, date)
 
 	endName, ends := instanceEnds[master.Name]
 	if !ends {
@@ -318,7 +336,11 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 		return instance, nil
 	}
 	if endProp == nil {
-		impliedEnd(instance, master, occ)
+		// An all-day event with no stated end lasts its day (RFC 5545 §3.6.1),
+		// which a DATE-TIME start would no longer imply.
+		if allDay && !date && master.Name == ical.CompEvent && master.Props.Get(ical.PropDuration) == nil {
+			instance.Props.SetDateTime(ical.PropDateTimeEnd, occ.start.AddDate(0, 0, 1).UTC())
+		}
 		return instance, nil
 	}
 	start, err := startProp.DateTime(time.UTC)
@@ -329,23 +351,8 @@ func recurrenceInstance(master *ical.Component, occ occurrence) (*ical.Component
 	if err != nil {
 		return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid %s", endName)
 	}
-	setInstant(instance.Props, endName, occ.start.Add(end.Sub(start)), occ.date && isDate(endProp))
+	setInstant(instance.Props, endName, occ.start.Add(end.Sub(start)), date)
 	return instance, nil
-}
-
-// impliedEnd states the end of an event instance whose master leaves it to
-// DTSTART's type (RFC 5545 §3.6.1: a DATE lasts a day, a DATE-TIME an instant)
-// when the instance's start is of the other type and would imply another.
-func impliedEnd(instance, master *ical.Component, occ occurrence) {
-	allDay := isDate(master.Props.Get(ical.PropDateTimeStart))
-	if master.Name != ical.CompEvent || master.Props.Get(ical.PropDuration) != nil || occ.date == allDay {
-		return
-	}
-	end := occ.start
-	if allDay {
-		end = occ.start.AddDate(0, 0, 1)
-	}
-	instance.Props.SetDateTime(ical.PropDateTimeEnd, end.UTC())
 }
 
 // instanceEnds names the property that ends an instance of each kind that has

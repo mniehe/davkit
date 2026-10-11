@@ -77,32 +77,51 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, per
 		return true, nil
 	}
 
-	// The original instance is the master materialised at the RECURRENCE-ID.
-	// Without a master to take the shape from — a detached instance stored on
-	// its own — the override's own shape is carried back to that time instead.
-	shape := ov
-	if master, ok := masters[propValue(ov, ical.PropUID)]; ok {
-		shape = master
+	// The original instance is the master's occurrence at the RECURRENCE-ID,
+	// measured as matching measures it. Without a master — a detached instance
+	// stored on its own — the override's own shape is carried back to that
+	// time instead.
+	named := occurrence{start: rid, date: isDate(ridProp)}
+	master, ok := masters[propValue(ov, ical.PropUID)]
+	if !ok {
+		return detachedImpacts(ov, named, periods, window)
 	}
-	original, err := originalInstance(shape, occurrence{start: rid, date: isDate(ridProp)}, periods)
+
+	occ, err := originalOccurrence(master, named, periods)
+	if err != nil {
+		return false, err
+	}
+	extent, err := extentOf(master, time.UTC)
+	if err != nil {
+		return false, fmt.Errorf("caldav: stored master holds an unreadable interval: %w", err)
+	}
+	return extent.overlaps(window.Start, window.End, occ), nil
+}
+
+func detachedImpacts(ov *ical.Component, named occurrence, periods *periodIndex, window *calendarTimeWindow) (bool, error) {
+	occ, err := originalOccurrence(ov, named, periods)
+	if err != nil {
+		return false, err
+	}
+	original, err := recurrenceInstance(ov, occ)
 	if err != nil {
 		return false, err
 	}
 	return compOverlaps(window.Start, window.End, original)
 }
 
-// originalInstance materialises shape at the instance a RECURRENCE-ID names,
-// with the end of the RDATE period that starts there when shape lists one.
-func originalInstance(shape *ical.Component, named occurrence, periods *periodIndex) (*ical.Component, error) {
+// originalOccurrence is the occurrence a RECURRENCE-ID names, ending where the
+// RDATE period that starts there ends when shape lists one.
+func originalOccurrence(shape *ical.Component, named occurrence, periods *periodIndex) (occurrence, error) {
 	occ, found, err := periods.at(shape, named.start)
 	if errors.Is(err, errTooManyRecurrenceDates) {
-		return nil, expansionOverflow()
+		return occurrence{}, expansionOverflow()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("caldav: stored master holds an unreadable RDATE or EXDATE: %w", err)
+		return occurrence{}, fmt.Errorf("caldav: stored master holds an unreadable RDATE or EXDATE: %w", err)
 	}
 	if !found {
-		occ = named
+		return named, nil
 	}
-	return recurrenceInstance(shape, occ)
+	return occ, nil
 }

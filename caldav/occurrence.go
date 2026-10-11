@@ -101,6 +101,15 @@ func recurrenceOf(comp *ical.Component, loc *time.Location) (*recurrence, error)
 	return rec, nil
 }
 
+// timedOnAllDay reports whether a DATE series lists a DATE-TIME or PERIOD
+// occurrence, which a DATE RECURRENCE-ID cannot name without losing its time.
+func (r *recurrence) timedOnAllDay() bool {
+	if !r.allDay {
+		return false
+	}
+	return slices.ContainsFunc(r.dates, func(d occurrence) bool { return !d.date })
+}
+
 // iterator walks the set in ascending start order. A start shared by the rule
 // and an RDATE is one occurrence, keeping the RDATE's period when it has one.
 func (r *recurrence) iterator() func() (occurrence, bool) {

@@ -293,3 +293,215 @@ func TestAnOccurrenceAtTheZeroInstantDoesNotEndAnOpenWalk(t *testing.T) {
 		},
 	})
 }
+
+// RFC 5545 §3.8.4.4 gives RECURRENCE-ID the value type of DTSTART, and
+// §3.8.2.2 and §3.8.2.3 give DTEND and DUE the same, while §3.8.5.2 lets each
+// RDATE be of any type. An expanded instance therefore takes the master's
+// type: a DATE on a timed series is its midnight, and a time of day on an
+// all-day series has no DATE to name it, so the expand report refuses the
+// object. Matching, free-busy and limit-recurrence-set read the exact instant.
+func TestMixedExtraDatesTakeTheMastersValueType(t *testing.T) {
+	const (
+		movedEvent = "UID:fixture\r\nSUMMARY:Moved\r\nRECURRENCE-ID:20260808T090000Z\r\nDTSTART;VALUE=DATE:20260901\r\n"
+		wideFB     = "20260905T000000Z"
+	)
+	window := func(start, end string) crossWindow { return crossWindow{start, end} }
+	fixtures := map[string]*crossPaths{
+		"DATE-TIME event, DATE RDATE": {
+			comp: ical.CompEvent,
+			ics: eventCalendar(
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART:20260801T090000Z\r\nDTEND:20260801T100000Z\r\nRDATE;VALUE=DATE:20260808,20260815\r\n",
+				"UID:fixture\r\nSUMMARY:Moved\r\nRECURRENCE-ID:20260808T000000Z\r\nDTSTART:20260901T090000Z\r\nDTEND:20260901T100000Z\r\n",
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260815T003000Z", "20260815T010000Z"), true},
+				{window("20260815T010000Z", "20260815T020000Z"), false},
+				{window("20260808T000000Z", "20260808T010000Z"), false},
+				{window("20260901T093000Z", "20260901T100000Z"), true},
+			},
+			expand:       window("20260815T000000Z", "20260816T000000Z"),
+			expandStatus: http.StatusMultiStatus,
+			instances: []crossInstance{{
+				ical.PropDateTimeStart: "DATE-TIME:20260815T000000Z",
+				ical.PropRecurrenceID:  "DATE-TIME:20260815T000000Z",
+				ical.PropDateTimeEnd:   "DATE-TIME:20260815T010000Z",
+			}},
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			busy:           []string{"20260815T000000Z/20260815T010000Z", "20260901T090000Z/20260901T100000Z"},
+			limits: []crossLimit{
+				{window("20260808T003000Z", "20260808T010000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260808T010000Z", "20260808T020000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE-TIME to-do, DATE RDATE": {
+			comp: ical.CompToDo,
+			ics: componentCalendar(ical.CompToDo,
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART:20260801T090000Z\r\nDUE:20260801T170000Z\r\nRDATE;VALUE=DATE:20260808,20260815\r\n",
+				"UID:fixture\r\nSUMMARY:Moved\r\nRECURRENCE-ID:20260808T000000Z\r\nDTSTART:20260901T090000Z\r\nDUE:20260901T170000Z\r\n",
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260815T060000Z", "20260815T070000Z"), true},
+				{window("20260815T090000Z", "20260815T100000Z"), false},
+				{window("20260808T060000Z", "20260808T070000Z"), false},
+			},
+			expand:       window("20260815T000000Z", "20260816T000000Z"),
+			expandStatus: http.StatusMultiStatus,
+			instances: []crossInstance{{
+				ical.PropDateTimeStart: "DATE-TIME:20260815T000000Z",
+				ical.PropRecurrenceID:  "DATE-TIME:20260815T000000Z",
+				ical.PropDue:           "DATE-TIME:20260815T080000Z",
+			}},
+			// A to-do is no busy time (RFC 4791 §7.10).
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			limits: []crossLimit{
+				{window("20260808T060000Z", "20260808T070000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260808T090000Z", "20260808T100000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE event without an end, DATE-TIME RDATE": {
+			comp: ical.CompEvent,
+			ics: eventCalendar(
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nRDATE:20260808T090000Z,20260815T090000Z\r\n",
+				movedEvent,
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260816T080000Z", "20260816T083000Z"), true},
+				{window("20260815T080000Z", "20260815T083000Z"), false},
+				{window("20260816T090000Z", "20260816T100000Z"), false},
+				{window("20260809T080000Z", "20260809T083000Z"), false},
+			},
+			expand:         window("20260801T000000Z", "20260901T000000Z"),
+			expandStatus:   http.StatusForbidden,
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			busy:           []string{"20260815T090000Z/20260816T090000Z", "20260901T000000Z/20260902T000000Z"},
+			limits: []crossLimit{
+				{window("20260809T080000Z", "20260809T083000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260808T080000Z", "20260808T083000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE event lasting two days, DATE-TIME RDATE": {
+			comp: ical.CompEvent,
+			ics: eventCalendar(
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nDTEND;VALUE=DATE:20260803\r\nRDATE:20260808T090000Z,20260815T090000Z\r\n",
+				movedEvent,
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260817T080000Z", "20260817T083000Z"), true},
+				{window("20260815T080000Z", "20260815T083000Z"), false},
+				{window("20260817T090000Z", "20260817T100000Z"), false},
+			},
+			expand:         window("20260801T000000Z", "20260901T000000Z"),
+			expandStatus:   http.StatusForbidden,
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			busy:           []string{"20260815T090000Z/20260817T090000Z", "20260901T000000Z/20260902T000000Z"},
+			limits: []crossLimit{
+				{window("20260810T080000Z", "20260810T083000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260810T090000Z", "20260810T100000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE event, PERIOD RDATE": {
+			comp: ical.CompEvent,
+			ics: eventCalendar(
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nRDATE;VALUE=PERIOD:20260808T090000Z/PT3H,20260815T090000Z/PT2H\r\n",
+				movedEvent,
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260815T103000Z", "20260815T104500Z"), true},
+				{window("20260815T113000Z", "20260815T120000Z"), false},
+				{window("20260808T100000Z", "20260808T103000Z"), false},
+			},
+			expand:         window("20260801T000000Z", "20260901T000000Z"),
+			expandStatus:   http.StatusForbidden,
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			busy:           []string{"20260815T090000Z/20260815T110000Z", "20260901T000000Z/20260902T000000Z"},
+			limits: []crossLimit{
+				{window("20260808T113000Z", "20260808T114500Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260808T120000Z", "20260808T130000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE event, DATE-TIME RDATE excluded": {
+			comp: ical.CompEvent,
+			ics:  eventCalendar("UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nRDATE:20260808T090000Z\r\nEXDATE:20260808T090000Z\r\nRDATE;VALUE=DATE:20260815\r\n"),
+			put:  http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260808T100000Z", "20260808T103000Z"), false},
+				{window("20260815T100000Z", "20260815T103000Z"), true},
+			},
+			expand:       window("20260815T000000Z", "20260816T000000Z"),
+			expandStatus: http.StatusMultiStatus,
+			instances: []crossInstance{{
+				ical.PropDateTimeStart: "DATE:20260815",
+				ical.PropRecurrenceID:  "DATE:20260815",
+				ical.PropDateTimeEnd:   "",
+			}},
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			busy:           []string{"20260815T000000Z/20260816T000000Z"},
+			limits: []crossLimit{
+				{window("20260801T000000Z", "20260901T000000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE journal, DATE-TIME RDATE": {
+			comp: ical.CompJournal,
+			ics: componentCalendar(ical.CompJournal,
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nRDATE:20260808T090000Z,20260815T090000Z\r\n",
+				movedEvent,
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260816T080000Z", "20260816T083000Z"), true},
+				{window("20260815T080000Z", "20260815T083000Z"), false},
+				{window("20260809T080000Z", "20260809T083000Z"), false},
+			},
+			expand:       window("20260801T000000Z", "20260901T000000Z"),
+			expandStatus: http.StatusForbidden,
+			// A journal entry is no busy time (RFC 4791 §7.10).
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			limits: []crossLimit{
+				{window("20260809T080000Z", "20260809T083000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260808T080000Z", "20260808T083000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+		"DATE journal, DATE override": {
+			comp: ical.CompJournal,
+			ics: componentCalendar(ical.CompJournal,
+				"UID:fixture\r\nSUMMARY:Master\r\nDTSTART;VALUE=DATE:20260801\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n",
+				"UID:fixture\r\nSUMMARY:Moved\r\nRECURRENCE-ID;VALUE=DATE:20260808\r\nDTSTART;VALUE=DATE:20260901\r\n",
+			),
+			put: http.StatusCreated,
+			queries: []crossQuery{
+				{window("20260808T120000Z", "20260808T130000Z"), false},
+				{window("20260815T120000Z", "20260815T130000Z"), true},
+				{window("20260901T120000Z", "20260901T130000Z"), true},
+			},
+			expand:       window("20260815T000000Z", "20260816T000000Z"),
+			expandStatus: http.StatusMultiStatus,
+			instances: []crossInstance{{
+				ical.PropDateTimeStart: "DATE:20260815",
+				ical.PropRecurrenceID:  "DATE:20260815",
+			}},
+			freeBusy:       window("20260805T000000Z", wideFB),
+			freeBusyStatus: http.StatusOK,
+			limits: []crossLimit{
+				{window("20260808T120000Z", "20260808T130000Z"), http.StatusMultiStatus, []string{"Master", "Moved"}},
+				{window("20260809T000000Z", "20260809T010000Z"), http.StatusMultiStatus, []string{"Master"}},
+			},
+		},
+	}
+	for name, fixture := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			runCrossPaths(t, fixture)
+		})
+	}
+}

@@ -48,7 +48,7 @@ func (a *adapter) reportFreeBusy(w http.ResponseWriter, r *http.Request, acc acc
 		if parseErr != nil {
 			return fmt.Errorf("caldav: item %q holds bytes that do not parse as iCalendar: %w", items[i].Name, parseErr)
 		}
-		expanded, expandErr := expandCalendarWithin(data, &window, budget)
+		expanded, expandErr := expandCalendarWithin(data, &window, budget, forBusyTime)
 		if expandErr != nil {
 			return expandErr
 		}
