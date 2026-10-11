@@ -1,6 +1,7 @@
 package caldav_test
 
 import (
+	"cmp"
 	"encoding/xml"
 	"net/http"
 	"slices"
@@ -43,6 +44,8 @@ type crossPaths struct {
 	put int
 
 	queries []crossQuery
+	// queryStatus is what every query answers when it is not 207 Multi-Status.
+	queryStatus int
 
 	expand       crossWindow
 	expandStatus int
@@ -78,8 +81,12 @@ func runCrossPaths(t *testing.T, c *crossPaths) {
 	t.Run("calendar-query", func(t *testing.T) {
 		for _, q := range c.queries {
 			w := report(t, h, "/alice/work/", crossTimeRangeQuery(c.comp, q.window))
+			want := cmp.Or(c.queryStatus, http.StatusMultiStatus)
+			if w.Code != want {
+				t.Errorf("%v: status = %d, want %d\n%s", q.window, w.Code, want, w.Body.String())
+				continue
+			}
 			if w.Code != http.StatusMultiStatus {
-				t.Errorf("%v: status = %d, want %d\n%s", q.window, w.Code, http.StatusMultiStatus, w.Body.String())
 				continue
 			}
 			if got := len(crossCalendarData(t, w.Body.Bytes())) == 1; got != q.matches {

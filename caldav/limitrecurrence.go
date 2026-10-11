@@ -3,10 +3,12 @@ package caldav
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/mniehe/davkit/internal"
 )
 
 // limitRecurrenceCalendar returns cal without the overridden recurrence
@@ -87,13 +89,15 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, per
 		return detachedImpacts(ov, named, periods, window)
 	}
 
+	// The interval is read first: the master's extra dates are read against
+	// its DTSTART, which would otherwise fail there as an unreadable RDATE.
+	extent, err := extentOf(master, time.UTC)
+	if err != nil {
+		return false, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot limit recurrence set: invalid component interval")
+	}
 	occ, err := originalOccurrence(master, named, periods)
 	if err != nil {
 		return false, err
-	}
-	extent, err := extentOf(master, time.UTC)
-	if err != nil {
-		return false, fmt.Errorf("caldav: stored master holds an unreadable interval: %w", err)
 	}
 	return extent.overlaps(window.Start, window.End, occ), nil
 }
