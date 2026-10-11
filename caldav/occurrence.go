@@ -52,6 +52,9 @@ func recurrenceOf(comp *ical.Component, loc *time.Location) (*recurrence, error)
 	if len(split.Props[ical.PropRecurrenceDates])+len(split.Props[ical.PropExceptionDates]) > maxRecurrenceIterations {
 		return nil, errTooManyRecurrenceDates
 	}
+	if err := zoneDates(split, loc); err != nil {
+		return nil, err
+	}
 
 	rec := &recurrence{allDay: isDate(split.Props.Get(ical.PropDateTimeStart))}
 	if hasRule {
@@ -99,6 +102,49 @@ func recurrenceOf(comp *ical.Component, loc *time.Location) (*recurrence, error)
 		}
 	}
 	return rec, nil
+}
+
+// zoneDates rewrites, on a DATE-TIME series, each DATE among split's RDATE
+// and EXDATE values as the instant of its midnight in the zone DTSTART is read
+// in, so that every reader of the set places it at the same instant. split
+// must come from splitDateLists, whose lists are its own to replace. An
+// embedded VTIMEZONE's zone is gone by the time DTSTART is read here;
+// resolveComponentTimes rewrites those dates while it still knows it.
+func zoneDates(split *ical.Component, loc *time.Location) error {
+	startProp := split.Props.Get(ical.PropDateTimeStart)
+	if startProp == nil || isDate(startProp) {
+		return nil
+	}
+
+	var zone *time.Location
+	for _, name := range []string{ical.PropRecurrenceDates, ical.PropExceptionDates} {
+		props := split.Props[name]
+		if !slices.ContainsFunc(props, func(p ical.Prop) bool { return isDate(&p) }) {
+			continue
+		}
+		if zone == nil {
+			start, err := startProp.DateTime(loc)
+			if err != nil {
+				return fmt.Errorf("caldav: invalid DTSTART %q: %w", startProp.Value, err)
+			}
+			zone = start.Location()
+		}
+
+		rewritten := slices.Clone(props)
+		for i := range rewritten {
+			if !isDate(&rewritten[i]) {
+				continue
+			}
+			midnight, err := rewritten[i].DateTime(zone)
+			if err != nil {
+				return fmt.Errorf("caldav: invalid %s %q: %w", name, rewritten[i].Value, err)
+			}
+			rewritten[i] = *ical.NewProp(name)
+			rewritten[i].SetDateTime(midnight.UTC())
+		}
+		split.Props[name] = rewritten
+	}
+	return nil
 }
 
 // timedOnAllDay reports whether a DATE series lists a DATE-TIME or PERIOD
@@ -180,9 +226,10 @@ func isDate(prop *ical.Prop) bool {
 }
 
 // recurrenceDate reads one RDATE value by its own type, which RFC 5545
-// §3.8.5.2 does not tie to DTSTART's: a DATE is midnight in loc. A period is
-// recognised by its separator rather than by VALUE=PERIOD, because
-// resolveObjectTimes rewrites a zoned period to UTC and marks it DATE-TIME.
+// §3.8.5.2 does not tie to DTSTART's: a DATE zoneDates left alone, which only
+// a DATE series has, is midnight in loc. A period is recognised by its
+// separator rather than by VALUE=PERIOD, because resolveObjectTimes rewrites a
+// zoned period to UTC and marks it DATE-TIME.
 func recurrenceDate(prop *ical.Prop, loc *time.Location) (occurrence, error) {
 	if !strings.Contains(prop.Value, periodSeparator) {
 		start, err := prop.DateTime(loc)
@@ -265,6 +312,9 @@ func (p *periodIndex) read(master *ical.Component) ([]occurrence, error) {
 	}
 	p.budget -= listed
 
+	if err := zoneDates(split, time.UTC); err != nil {
+		return nil, err
+	}
 	excluded, err := exceptionDates(split, time.UTC)
 	if err != nil {
 		return nil, err

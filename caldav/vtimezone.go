@@ -89,6 +89,11 @@ func resolveObjectTimes(cal *ical.Calendar, fallback *tzResolver) (*ical.Calenda
 }
 
 func resolveComponentTimes(comp *ical.Component, zones map[string]*tzResolver, fallback *tzResolver) error {
+	if r := startResolver(comp, zones, fallback); r != nil {
+		if err := resolveSeriesDates(comp, r); err != nil {
+			return err
+		}
+	}
 	for name := range comp.Props {
 		for i := range comp.Props[name] {
 			prop := &comp.Props[name][i]
@@ -111,6 +116,59 @@ func resolveComponentTimes(comp *ical.Component, zones map[string]*tzResolver, f
 		}
 	}
 	return nil
+}
+
+// startResolver is the resolver comp's DATE-TIME DTSTART is rewritten with,
+// or nil when DTSTART is left for go-ical to read.
+func startResolver(comp *ical.Component, zones map[string]*tzResolver, fallback *tzResolver) *tzResolver {
+	prop := comp.Props.Get(ical.PropDateTimeStart)
+	if prop == nil || prop.ValueType() == ical.ValueDate || strings.HasSuffix(prop.Value, "Z") {
+		return nil
+	}
+	if tzid := prop.Params.Get(ical.ParamTimezoneID); tzid != "" {
+		return zones[tzid]
+	}
+	return fallback
+}
+
+// resolveSeriesDates rewrites each DATE among comp's RDATE and EXDATE values
+// as the UTC instant of its midnight in r, the zone of comp's DTSTART, which
+// is where a DATE in a DATE-TIME series falls. Once DTSTART is rewritten to UTC
+// that zone can no longer be recovered from it. A list holding a value that is
+// not a date is left as it was, for its reader to refuse.
+func resolveSeriesDates(comp *ical.Component, r *tzResolver) error {
+	for _, name := range []string{ical.PropRecurrenceDates, ical.PropExceptionDates} {
+		for i := range comp.Props[name] {
+			prop := &comp.Props[name][i]
+			if prop.ValueType() != ical.ValueDate {
+				continue
+			}
+			value, ok, err := midnightsToUTC(prop.Value, r)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			prop.Value = value
+			prop.SetValueType(ical.ValueDateTime)
+		}
+	}
+	return nil
+}
+
+// midnightsToUTC converts a comma-separated list of DATEs to the UTC instants
+// of their midnights in r, reporting ok=false when one of them is not a date.
+func midnightsToUTC(dates string, r *tzResolver) (utc string, ok bool, err error) {
+	parts := strings.Split(dates, ",")
+	for i, part := range parts {
+		midnight, converted, err := localInstantToUTC(part+"T000000", r)
+		if err != nil || !converted {
+			return "", false, err
+		}
+		parts[i] = midnight
+	}
+	return strings.Join(parts, ","), true, nil
 }
 
 // rewritePropToUTC converts a property's DATE-TIME value(s) to UTC using r and
