@@ -69,7 +69,7 @@ func (e *occurrenceExtent) overlaps(start, end time.Time, occ occurrence) bool {
 func (t *todoTimes) at(occ occurrence) todoTimes {
 	moved := *t
 	if t.hasStart && t.hasDue {
-		moved.due = t.due.Add(occ.start.Sub(t.start))
+		moved.due = occ.start.Add(t.due.Sub(t.start))
 	}
 	moved.start = occ.start
 	if occ.own {

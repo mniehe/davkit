@@ -104,10 +104,14 @@ func parseItemBody(body []byte) (parsedItem, error) {
 // recurrenceReadable reports whether every component's RRULE, RDATE, EXDATE
 // and RECURRENCE-ID read the way the matcher and the expander will read them,
 // so that storing the object cannot fail every later query on its calendar.
-// A set too large for those walks to finish is refused for the same reason.
+// A set too large for those walks to finish is refused for the same reason,
+// as is a ranged override whose move or length does not read.
 func recurrenceReadable(cal *ical.Calendar) bool {
 	resolved, err := resolveObjectTimes(cal, nil)
 	if err != nil {
+		return false
+	}
+	if _, err := buildOverrideIndexes(resolved.Children, time.UTC); err != nil {
 		return false
 	}
 	for _, comp := range resolved.Children {

@@ -113,14 +113,14 @@ func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget
 		return nil, err
 	}
 
-	byKey := make(map[string]*recurrenceOverride, len(overrides))
-	for i := range overrides {
-		byKey[overrides[i].key] = &overrides[i]
+	indexes, err := buildOverrideIndexes(cal.Children, time.UTC)
+	if err != nil {
+		return nil, internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid ranged override")
 	}
 
 	consumed := make(map[string]bool, len(overrides))
 	for _, master := range masters {
-		if err := expandMaster(master, req, byKey, consumed, emit); err != nil {
+		if err := expandMaster(master, req, indexes[master.uid], consumed, emit); err != nil {
 			return nil, err
 		}
 	}
@@ -138,7 +138,12 @@ func expandCalendarWithin(cal *ical.Calendar, req *calendarExpandRequest, budget
 		if !intervalOverlaps(req.Start, req.End, ovStart, ovEnd) {
 			continue
 		}
-		if err := emit(instanceTimesToUTC(cloneComponent(ov.comp))); err != nil {
+		ridDate := isDate(ov.comp.Props.Get(ical.PropRecurrenceID))
+		instance, err := overrideInstance(ov.comp, 0, ov.recurrenceID, ridDate)
+		if err != nil {
+			return nil, expansionError(err)
+		}
+		if err := emit(instance); err != nil {
 			return nil, err
 		}
 	}
@@ -223,65 +228,77 @@ func partitionForExpansion(cal *ical.Calendar, use expansionUse) (masters []recu
 	return masters, overrides, plain, nil
 }
 
-func expandMaster(master recurrenceMaster, req *calendarExpandRequest, byKey map[string]*recurrenceOverride, consumed map[string]bool, emit func(*ical.Component) error) error {
+func expandMaster(master recurrenceMaster, req *calendarExpandRequest, overrides *overrideIndex, consumed map[string]bool, emit func(*ical.Component) error) error {
 	extent, err := extentOf(master.comp, time.UTC)
 	if err != nil {
 		return internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid component interval")
 	}
+	walk := newSeriesWalk(master.comp, &extent, overrides)
+	// A range moving occurrences earlier brings ones starting after the window
+	// into it, so the walk looks that much further.
+	horizon := overrides.horizon(req.End)
 	next := master.rec.iterator()
 	// Occurrences increase, so the walk ends either when the set runs out or
-	// when their starts pass the window. Reaching the iteration cap instead means
-	// the answer would be incomplete, which is worse than refusing. An occurrence
-	// beginning before the window can still reach into it.
+	// when their starts pass the horizon. Reaching the iteration cap instead
+	// means the answer would be incomplete, which is worse than refusing. An
+	// occurrence beginning before the window can still reach into it.
 	for i := 0; i < maxRecurrenceIterations; i++ {
 		occ, ok := next()
 		if !ok {
 			return nil
 		}
-		if occ.start.After(req.End) {
+		if occ.start.After(horizon) {
 			return nil
 		}
-		if err := expandOccurrence(master, &extent, occ, req, byKey, consumed, emit); err != nil {
+		inst, err := walk.resolve(occ)
+		if err != nil {
+			return expansionError(err)
+		}
+		if err := expandInstance(&inst, master, req, consumed, emit); err != nil {
 			return err
 		}
-		// An occurrence starting on the end has been tested and a later one
-		// cannot overlap, so asking for it would only spend the iteration cap.
-		if !req.End.IsZero() && occ.start.Equal(req.End) {
+		// An occurrence starting on the horizon has been tested and a later
+		// one cannot overlap, so asking for it would only spend the iteration
+		// cap.
+		if !req.End.IsZero() && occ.start.Equal(horizon) {
 			return nil
 		}
 	}
 	return expansionOverflow()
 }
 
-func expandOccurrence(master recurrenceMaster, extent *occurrenceExtent, occ occurrence, req *calendarExpandRequest, byKey map[string]*recurrenceOverride, consumed map[string]bool, emit func(*ical.Component) error) error {
+func expandInstance(inst *effectiveInstance, master recurrenceMaster, req *calendarExpandRequest, consumed map[string]bool, emit func(*ical.Component) error) error {
 	// An override replaces the occurrence wherever it moved it, so it is
 	// judged on its own time, and claimed even when the original time is
 	// outside the window so the pass over unclaimed overrides skips it.
-	key := overrideKey(master.uid, occ.start)
-	if ov, found := byKey[key]; found {
-		consumed[key] = true
-		return emitOverride(ov, req, emit)
+	if inst.kind == fromExact {
+		consumed[overrideKey(master.uid, inst.original.start)] = true
 	}
-
-	if !extent.overlaps(req.Start, req.End, occ) {
+	if inst.kind == beyondYears {
 		return nil
 	}
-	instance, err := recurrenceInstance(master.comp, occ)
-	if err != nil {
-		return err
-	}
-	return emit(instance)
-}
 
-func emitOverride(ov *recurrenceOverride, req *calendarExpandRequest, emit func(*ical.Component) error) error {
-	overlaps, err := compOverlaps(req.Start, req.End, ov.comp)
+	overlaps, err := inst.overlaps(req.Start, req.End)
 	if err != nil {
 		return internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: invalid override interval")
 	}
 	if !overlaps {
 		return nil
 	}
-	return emit(instanceTimesToUTC(cloneComponent(ov.comp)))
+	instance, err := inst.materialise(master.comp)
+	if err != nil {
+		return expansionError(err)
+	}
+	return emit(instance)
+}
+
+// expansionError answers an instance moved outside the years iCalendar can
+// write as the expansion's own refusal; any other error is already one.
+func expansionError(err error) error {
+	if errors.Is(err, errInstantOutOfRange) {
+		return internal.HTTPErrorf(http.StatusForbidden, "caldav: cannot expand recurrence: an instance moves outside the years iCalendar can write")
+	}
+	return err
 }
 
 func expansionOverflow() error {

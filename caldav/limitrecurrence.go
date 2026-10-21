@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
@@ -74,9 +73,17 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, per
 		return false, fmt.Errorf("caldav: stored override holds an unreadable RECURRENCE-ID: %w", err)
 	}
 	// RANGE=THISANDFUTURE redefines every instance from the RECURRENCE-ID on,
-	// so the override matters whenever the window reaches past that point.
-	if strings.EqualFold(ridProp.Params.Get(ical.ParamRange), "THISANDFUTURE") && rid.Before(window.End) {
-		return true, nil
+	// and one moving them earlier puts them as early as its own DTSTART, so
+	// the override matters whenever the window reaches past the earlier of the
+	// two. Retention is judged without walking the series.
+	if isRanged(ridProp) {
+		from, reachErr := rangedReach(ov, rid)
+		if reachErr != nil {
+			return false, reachErr
+		}
+		if from.Before(window.End) {
+			return true, nil
+		}
 	}
 
 	// The original instance is the master's occurrence at the RECURRENCE-ID,
@@ -100,6 +107,19 @@ func overrideImpacts(ov *ical.Component, masters map[string]*ical.Component, per
 		return false, err
 	}
 	return extent.overlaps(window.Start, window.End, occ), nil
+}
+
+// rangedReach is the earliest time a ranged override can put an instance:
+// its RECURRENCE-ID, or its DTSTART when that is earlier.
+func rangedReach(ov *ical.Component, rid time.Time) (time.Time, error) {
+	start, ok, err := optDateTime(ov, ical.PropDateTimeStart, time.UTC)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("caldav: stored override holds an unreadable DTSTART: %w", err)
+	}
+	if ok && start.Before(rid) {
+		return start, nil
+	}
+	return rid, nil
 }
 
 func detachedImpacts(ov *ical.Component, named occurrence, periods *periodIndex, window *calendarTimeWindow) (bool, error) {

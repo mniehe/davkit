@@ -62,18 +62,27 @@ func match(filter *compFilter, comp *ical.Component) (bool, error) {
 }
 
 // matchAmong is match for a component whose siblings may override some of its
-// occurrences; overridden holds their overrideKey values.
-func matchAmong(filter *compFilter, comp *ical.Component, overridden map[string]bool) (bool, error) {
+// occurrences; overrides indexes those of its UID.
+func matchAmong(filter *compFilter, comp *ical.Component, overrides *overrideIndex) (bool, error) {
 	if comp.Name != filter.Name || filter.IsNotDefined {
 		return false, nil
 	}
 
-	if hasTimeRange(filter) {
-		ok, err := matchTimeRangeAmong(filter.Start, filter.End, comp, overridden)
-		if err != nil || !ok {
-			return false, err
-		}
+	nested := func(instance *ical.Component) (bool, error) {
+		return matchNested(filter, instance)
 	}
+	if hasTimeRange(filter) {
+		reuse := verdictPerTemplate
+		if readsInstanceTimes(filter) {
+			reuse = verdictPerInstance
+		}
+		return matchTimeRangeAmong(filter.Start, filter.End, comp, overrides, nested, reuse)
+	}
+	return nested(comp)
+}
+
+// matchNested applies filter's component and property filters to comp.
+func matchNested(filter *compFilter, comp *ical.Component) (bool, error) {
 	for i := range filter.Comps {
 		ok, err := matchCompFilter(&filter.Comps[i], comp)
 		if err != nil || !ok {
@@ -103,12 +112,18 @@ func matchCompFilter(filter *compFilter, comp *ical.Component) (bool, error) {
 		return true, nil
 	}
 
-	var overridden map[string]bool
+	// Children carrying RECURRENCE-ID redefine instances of their series (RFC
+	// 5545 §3.8.4.4), so a walk over the series must find each where they
+	// put it.
+	var overrides map[string]*overrideIndex
 	if hasTimeRange(filter) {
-		overridden = overrideKeys(comp.Children, filter.Start.Location())
+		var err error
+		if overrides, err = buildOverrideIndexes(comp.Children, filter.Start.Location()); err != nil {
+			return false, err
+		}
 	}
 	for _, child := range comp.Children {
-		ok, err := matchAmong(filter, child, overridden)
+		ok, err := matchAmong(filter, child, overrides[propValue(child, ical.PropUID)])
 		if err != nil {
 			return false, err
 		}
@@ -121,29 +136,6 @@ func matchCompFilter(filter *compFilter, comp *ical.Component) (bool, error) {
 
 func hasTimeRange(filter *compFilter) bool {
 	return !filter.Start.IsZero() || !filter.End.IsZero()
-}
-
-// overrideKeys names the instances that children carrying RECURRENCE-ID
-// redefine (RFC 5545 §3.8.4.4). Such an instance is no longer where its series
-// would put it, so a walk over the series must not find it there. A
-// RECURRENCE-ID that does not read names no instance, so it takes none away.
-func overrideKeys(children []*ical.Component, loc *time.Location) map[string]bool {
-	var keys map[string]bool
-	for _, child := range children {
-		prop := child.Props.Get(ical.PropRecurrenceID)
-		if prop == nil {
-			continue
-		}
-		rid, err := prop.DateTime(loc)
-		if err != nil {
-			continue
-		}
-		if keys == nil {
-			keys = make(map[string]bool)
-		}
-		keys[overrideKey(propValue(child, ical.PropUID), rid)] = true
-	}
-	return keys
 }
 
 func matchPropFilter(filter *propFilter, comp *ical.Component) (bool, error) {
@@ -422,14 +414,75 @@ func compOverlaps(start, end time.Time, comp *ical.Component) (bool, error) {
 	return false, nil
 }
 
-func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error) {
-	return matchTimeRangeAmong(start, end, comp, nil)
+// instanceTimeProps are the properties an instance writes from where it
+// occurs rather than copying from its template.
+var instanceTimeProps = map[string]bool{
+	ical.PropDateTimeStart: true,
+	ical.PropDateTimeEnd:   true,
+	ical.PropDue:           true,
+	ical.PropRecurrenceID:  true,
 }
 
-// matchTimeRangeAmong is matchCompTimeRange skipping the occurrences named in
-// overridden, which siblings of comp redefine.
-func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden map[string]bool) (bool, error) {
+// readsInstanceTimes reports whether filter's nested conditions could answer
+// differently for two instances of one template: a time-range anywhere below
+// it, or any condition on a property the instance writes from its own time.
+func readsInstanceTimes(filter *compFilter) bool {
+	for i := range filter.Props {
+		prop := &filter.Props[i]
+		if !prop.Start.IsZero() || !prop.End.IsZero() || instanceTimeProps[prop.Name] {
+			return true
+		}
+	}
+	for i := range filter.Comps {
+		if hasTimeRange(&filter.Comps[i]) || readsInstanceTimes(&filter.Comps[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchCompTimeRange(start, end time.Time, comp *ical.Component) (bool, error) {
+	return matchTimeRangeAmong(start, end, comp, nil, nil, verdictPerTemplate)
+}
+
+// asInstance is comp as expand writes it: an override is read as the
+// instance it names, with no RANGE, as the pass over overrides on their own
+// emits it. A component without a readable RECURRENCE-ID is read as stored.
+func asInstance(comp *ical.Component, loc *time.Location) (*ical.Component, error) {
+	prop := comp.Props.Get(ical.PropRecurrenceID)
+	if prop == nil {
+		return comp, nil
+	}
+	rid, err := prop.DateTime(loc)
+	if err != nil {
+		return comp, nil
+	}
+	return overrideInstance(comp, 0, rid, isDate(prop))
+}
+
+// instanceTest is a further condition an instance found in the window must
+// satisfy; nil accepts every one.
+type instanceTest func(instance *ical.Component) (bool, error)
+
+// verdictReuse says whether an instanceTest's verdict on one instance holds
+// for every instance taking its properties from the same template.
+type verdictReuse int
+
+const (
+	verdictPerInstance verdictReuse = iota
+	verdictPerTemplate
+)
+
+// matchTimeRangeAmong is matchCompTimeRange for a series whose siblings
+// override some of its occurrences. An occurrence an override names exactly is
+// skipped, since the override answers for itself; one a range governs is
+// tested where the range puts it, and accept judges the instance it becomes.
+func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overrides *overrideIndex, accept instanceTest, reuse verdictReuse) (bool, error) {
 	// See https://datatracker.ietf.org/doc/html/rfc4791#section-9.9
+
+	if accept == nil {
+		accept = func(*ical.Component) (bool, error) { return true, nil }
+	}
 
 	rec, err := recurrenceOf(comp, start.Location())
 	if errors.Is(err, errTooManyRecurrenceDates) {
@@ -439,7 +492,15 @@ func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden 
 		return false, err
 	}
 	if rec == nil {
-		return compOverlaps(start, end, comp)
+		overlaps, overlapErr := compOverlaps(start, end, comp)
+		if overlapErr != nil || !overlaps {
+			return false, overlapErr
+		}
+		instance, instanceErr := asInstance(comp, start.Location())
+		if instanceErr != nil {
+			return false, instanceErr
+		}
+		return accept(instance)
 	}
 
 	// Each occurrence is measured by the rules for the component's kind, read
@@ -450,32 +511,119 @@ func matchTimeRangeAmong(start, end time.Time, comp *ical.Component, overridden 
 		return false, err
 	}
 
-	// An occurrence beginning before the window can still reach into it, and a
-	// VTODO's inclusive rows can reach one starting exactly at its end.
-	uid := propValue(comp, ical.PropUID)
+	// An occurrence beginning before the window can still reach into it, a
+	// VTODO's inclusive rows can reach one starting exactly at its end, and a
+	// range moving occurrences earlier brings later ones into it.
+	walk := newSeriesWalk(comp, &extent, overrides)
+	horizon := overrides.horizon(end)
+	verdicts := templateVerdicts{accept: accept, reuse: reuse, master: comp}
 	next := rec.iterator()
 	for n := 0; n < maxRecurrenceIterations; n++ {
 		occ, ok := next()
 		if !ok {
 			return false, nil
 		}
-		if !end.IsZero() && occ.start.After(end) {
+		if !end.IsZero() && occ.start.After(horizon) {
 			// Occurrences only increase, so none remain in range.
 			return false, nil
 		}
-		if !overridden[overrideKey(uid, occ.start)] && extent.overlaps(start, end, occ) {
-			return true, nil
+		inst, err := walk.resolve(occ)
+		if err != nil {
+			return false, err
 		}
-		// Only a VTODO can match an occurrence starting on the end, and this
-		// one has been tested; a later one cannot, so asking for it would only
-		// spend the iteration cap.
-		if !end.IsZero() && occ.start.Equal(end) {
+		matched, err := matchInstance(start, end, &inst, &verdicts)
+		if err != nil || matched {
+			return matched, err
+		}
+		if verdicts.exhausted(walk) {
+			return false, nil
+		}
+		// Only a VTODO can match an occurrence starting on the horizon, and
+		// this one has been tested; a later one cannot, so asking for it would
+		// only spend the iteration cap.
+		if !end.IsZero() && occ.start.Equal(horizon) {
 			return false, nil
 		}
 	}
 	// Answering true here would return data the filter excluded: nothing has been
 	// established, only that the budget ran out.
 	return false, timeRangeOverflow()
+}
+
+func matchInstance(start, end time.Time, inst *effectiveInstance, verdicts *templateVerdicts) (bool, error) {
+	if inst.kind == fromExact || inst.kind == beyondYears || verdicts.failed(inst) {
+		return false, nil
+	}
+	overlaps, err := inst.overlaps(start, end)
+	if err != nil || !overlaps {
+		return false, err
+	}
+	return verdicts.judge(inst)
+}
+
+// templateVerdicts judges each template once, however many of its instances
+// fall in the window. The master is judged as itself, as it always was; a
+// range's template is judged as the first instance materialised from it, and
+// only when the test reads nothing an instance takes from its own time.
+type templateVerdicts struct {
+	accept instanceTest
+	reuse  verdictReuse
+	master *ical.Component
+	judged map[*ical.Component]bool
+}
+
+func (v *templateVerdicts) judge(inst *effectiveInstance) (bool, error) {
+	if inst.kind == fromMaster {
+		return v.cached(v.master, v.master)
+	}
+	instance, err := inst.materialise(v.master)
+	if err != nil {
+		return false, err
+	}
+	if v.reuse == verdictPerInstance {
+		return v.accept(instance)
+	}
+	return v.cached(inst.template, instance)
+}
+
+func (v *templateVerdicts) cached(template, instance *ical.Component) (bool, error) {
+	if pass, judged := v.judged[template]; judged {
+		return pass, nil
+	}
+	pass, err := v.accept(instance)
+	if err != nil {
+		return false, err
+	}
+	if v.judged == nil {
+		v.judged = make(map[*ical.Component]bool)
+	}
+	v.judged[template] = pass
+	return pass, nil
+}
+
+// failed reports whether inst's template is already known to fail.
+func (v *templateVerdicts) failed(inst *effectiveInstance) bool {
+	if inst.kind == fromRange && v.reuse == verdictPerInstance {
+		return false
+	}
+	pass, judged := v.judged[inst.template]
+	return judged && !pass
+}
+
+// exhausted reports whether no later occurrence of walk can match: every
+// template that could still govern one has failed. Past the last range, only
+// that range governs what is left.
+func (v *templateVerdicts) exhausted(walk *seriesWalk) bool {
+	ranged := walk.ranges()
+	if len(ranged) == 0 {
+		pass, judged := v.judged[v.master]
+		return judged && !pass
+	}
+	if v.reuse == verdictPerInstance || walk.governing < len(ranged) {
+		return false
+	}
+	pass, judged := v.judged[ranged[len(ranged)-1].comp]
+	return judged && !pass
 }
 
 func timeRangeOverflow() error {

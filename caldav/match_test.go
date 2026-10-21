@@ -389,3 +389,137 @@ END:VCALENDAR`)
 		})
 	}
 }
+
+// A series whose master and ranged override both fail the property filters
+// can match nowhere, so an open window answers that rather than walking an
+// endless rule to the iteration cap.
+func TestOpenWindowOverARangedSeriesStopsOnceEveryTemplateFails(t *testing.T) {
+	const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:u1
+DTSTAMP:20260101T000000Z
+SUMMARY:Master
+DTSTART:20260801T090000Z
+DTEND:20260801T100000Z
+RRULE:FREQ=DAILY
+END:VEVENT
+BEGIN:VEVENT
+UID:u1
+DTSTAMP:20260101T000000Z
+SUMMARY:Ranged
+RECURRENCE-ID;RANGE=THISANDFUTURE:20260803T090000Z
+DTSTART:20260803T110000Z
+DTEND:20260803T120000Z
+END:VEVENT
+END:VCALENDAR`
+	from := toDate(t, "20260901T000000Z")
+	summary := func(text string) propFilter {
+		return propFilter{Name: "SUMMARY", TextMatch: &textMatch{Text: text}}
+	}
+	tests := []struct {
+		name    string
+		props   []propFilter
+		want    bool
+		wantErr string
+	}{
+		{"neither template matches", []propFilter{summary("Elsewhere")}, false, ""},
+		{"the range's template matches", []propFilter{summary("Ranged")}, true, ""},
+		// A time-range on a property reads each instance's own times, so no
+		// verdict carries from one instance to the next: the walk tests every
+		// one and an endless rule reaches the cap, which is reported.
+		{"a property time-range keeps the walk per instance", []propFilter{
+			summary("Elsewhere"),
+			{Name: "DTSTART", Start: from},
+		}, false, "exceeded"},
+		// A time-range on SUMMARY itself asks for a date in a text value, which
+		// fails on the first instance tested, before any walk could run long.
+		{"a time-range on SUMMARY fails as unreadable", []propFilter{
+			{Name: "SUMMARY", Start: from, TextMatch: &textMatch{Text: "Elsewhere"}},
+		}, false, "cannot process"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := &compFilter{Name: "VCALENDAR", Comps: []compFilter{{Name: "VEVENT", Start: from, Props: tt.props}}}
+			co := &calendarObject{Path: "/u/c/e.ics", Data: parseCalendar(t, ics)}
+			matched, err := matchObject(filter, co)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Match: %v", err)
+			}
+			if matched != tt.want {
+				t.Errorf("matched = %v, want %v", matched, tt.want)
+			}
+		})
+	}
+}
+
+func TestTimeDependentFiltersAreThoseReadingInstanceTimes(t *testing.T) {
+	at := toDate(t, "20260901T000000Z")
+	tests := []struct {
+		name   string
+		filter compFilter
+		want   bool
+	}{
+		{"text only", compFilter{Name: "VEVENT", Props: []propFilter{{Name: "SUMMARY", TextMatch: &textMatch{Text: "x"}}}}, false},
+		{"property time-range start", compFilter{Name: "VEVENT", Props: []propFilter{{Name: "DTSTART", Start: at}}}, true},
+		{"text on a property the instance writes", compFilter{Name: "VEVENT", Props: []propFilter{{Name: "RECURRENCE-ID", TextMatch: &textMatch{Text: "2026"}}}}, true},
+		{"property time-range end", compFilter{Name: "VEVENT", Props: []propFilter{{Name: "DTSTART", End: at}}}, true},
+		{"nested property time-range", compFilter{Name: "VEVENT", Comps: []compFilter{{Name: "VALARM", Props: []propFilter{{Name: "TRIGGER", Start: at}}}}}, true},
+		{"nested component time-range", compFilter{Name: "VEVENT", Comps: []compFilter{{Name: "VALARM", Start: at}}}, true},
+		{"nested component without one", compFilter{Name: "VEVENT", Comps: []compFilter{{Name: "VALARM", IsNotDefined: true}}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := readsInstanceTimes(&tt.filter); got != tt.want {
+				t.Errorf("readsInstanceTimes = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A query reads an override as the instance expand writes, which names its
+// original time with no RANGE.
+func TestAQueryReadsARangedAnchorAsItsInstance(t *testing.T) {
+	const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:u1
+DTSTAMP:20260101T000000Z
+SUMMARY:Master
+DTSTART:20260801T090000Z
+DTEND:20260801T100000Z
+RRULE:FREQ=DAILY;COUNT=10
+END:VEVENT
+BEGIN:VEVENT
+UID:u1
+DTSTAMP:20260101T000000Z
+SUMMARY:Ranged
+RECURRENCE-ID;RANGE=THISANDFUTURE:20260803T090000Z
+DTSTART:20260803T110000Z
+DTEND:20260803T120000Z
+END:VEVENT
+END:VCALENDAR`
+	noRange := propFilter{Name: "RECURRENCE-ID", ParamFilter: []paramFilter{{Name: "RANGE", IsNotDefined: true}}}
+	filter := &compFilter{Name: "VCALENDAR", Comps: []compFilter{{
+		Name:  "VEVENT",
+		Start: toDate(t, "20260803T110000Z"),
+		End:   toDate(t, "20260803T120000Z"),
+		Props: []propFilter{noRange},
+	}}}
+	co := &calendarObject{Path: "/u/c/e.ics", Data: parseCalendar(t, ics)}
+	matched, err := matchObject(filter, co)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if !matched {
+		t.Errorf("matched = false, want the anchor read without its RANGE")
+	}
+}
